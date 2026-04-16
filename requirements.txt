@@ -1,18 +1,15 @@
 # Pipeline worker runtime dependencies.
-# Pins match the versions currently used in the local venv so the container
-# and local dev stay aligned. Update by bumping here, then `pip install -r`.
 
-# ── Web framework (new for the worker API) ─────────────────────────────
+# ── Web framework ──────────────────────────────────────────────────────
 fastapi==0.118.0
 uvicorn[standard]==0.32.0
 
-# ── Supabase + HTTP clients ────────────────────────────────────────────
+# ── Supabase + HTTP ────────────────────────────────────────────────────
 supabase==2.28.3
 httpx==0.28.1
-requests==2.32.5
 
-# ── LLM clients used by the CIP pipeline ───────────────────────────────
-google-generativeai==0.8.6
+# ── LLM clients ───────────────────────────────────────────────────────
+google-genai==1.68.0
 openai==2.29.0
 
 # ── Data validation ────────────────────────────────────────────────────

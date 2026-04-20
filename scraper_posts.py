@@ -1,10 +1,44 @@
+import logging
 import re
 from collections import Counter
 from datetime import datetime, timedelta
 
 from pipeline.brightdata_client import BrightdataClient
 
+logger = logging.getLogger(__name__)
+
 DATASET_POSTS = "gd_lk5ns7kz21pck8jpis"
+DATASET_REELS = "gd_lyclm20il4r5helnj"
+
+
+def scrape_single_post(
+    client: BrightdataClient, post_url: str
+) -> dict | None:
+    """
+    Scrape a single Instagram post/reel to get video_url and metadata.
+
+    Args:
+        client: Configured BrightdataClient
+        post_url: Full Instagram post/reel URL
+            e.g. https://www.instagram.com/reel/ABC123/
+
+    Returns:
+        Dict with video_url, description, likes, views, length etc.
+        None if scrape returned no results.
+    """
+    input_obj = {"url": post_url}
+    results = client.scrape_and_wait(DATASET_REELS, [input_obj])
+
+    if not results:
+        logger.warning(f"No data returned for post: {post_url}")
+        return None
+
+    post = results[0]
+    logger.info(
+        f"Scraped post {post.get('post_id', 'unknown')} — "
+        f"video_url={'yes' if post.get('video_url') else 'no'}"
+    )
+    return post
 
 
 def scrape_posts_discovery(

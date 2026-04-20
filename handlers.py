@@ -335,11 +335,214 @@ def handle_creator_ig_scrape(db, job: dict) -> None:
         _trigger_matching_compute(parent_brand_id)
 
 
+# ── Content Video Analysis ─────────────────────────────────────────────────
+
+
+def handle_content_video_analysis(db, job: dict) -> None:
+    """
+    Transcribe + qualitatively analyze a submitted campaign video.
+
+    Pipeline: fetch context → scrape video URL → transcribe (Whisper) →
+    analyze (Claude) → store results.
+    """
+    from pipeline.brightdata_client import BrightdataClient
+    from pipeline.content_analyzer import (
+        ANALYSIS_VERSION,
+        MODEL as ANALYSIS_MODEL,
+        analyze_submission_content,
+    )
+    from pipeline.scraper_posts import scrape_single_post
+    from pipeline.transcriber import transcribe_reels
+
+    payload = job.get("payload") or {}
+    submission_id = payload.get("content_submission_id")
+    content_url = payload.get("content_url")
+    campaign_id = payload.get("campaign_id")
+    creator_id = payload.get("creator_id")
+    brand_id = job.get("brand_id")
+
+    if not submission_id:
+        raise ValueError("content_video_analysis job missing content_submission_id")
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    def _update_analysis(analysis_id: str, patch: dict) -> None:
+        db.table("content_analyses").update(patch).eq("id", analysis_id).execute()
+
+    def _update_submission_status(status: str) -> None:
+        db.table("content_submissions").update(
+            {"analysis_status": status}
+        ).eq("id", submission_id).execute()
+
+    # ── 1. Check for existing analysis (idempotency) ──────────────────
+    existing = (
+        db.table("content_analyses")
+        .select("id,status")
+        .eq("content_submission_id", submission_id)
+        .execute()
+    )
+    if existing.data:
+        row = existing.data[0]
+        if row["status"] == "completed":
+            logger.info(f"Analysis already completed for submission {submission_id}, skipping")
+            return
+        analysis_id = row["id"]
+        _update_analysis(analysis_id, {"status": "transcribing", "error_message": None})
+    else:
+        # Create analysis row
+        insert_result = (
+            db.table("content_analyses")
+            .insert({
+                "content_submission_id": submission_id,
+                "campaign_id": campaign_id,
+                "creator_id": creator_id,
+                "brand_id": brand_id,
+                "status": "transcribing",
+                "analysis_version": ANALYSIS_VERSION,
+            })
+            .execute()
+        )
+        analysis_id = insert_result.data[0]["id"]
+
+    _update_submission_status("processing")
+
+    # ── 2. Fetch context ──────────────────────────────────────────────
+    submission = (
+        db.table("content_submissions")
+        .select("caption_text,content_url")
+        .eq("id", submission_id)
+        .single()
+        .execute()
+    ).data
+    caption_text = submission.get("caption_text") if submission else None
+
+    campaign = (
+        db.table("campaigns")
+        .select("name,goal,description,brief_requirements,target_regions,target_niches")
+        .eq("id", campaign_id)
+        .single()
+        .execute()
+    ).data or {}
+
+    guidelines_result = (
+        db.table("brand_guidelines")
+        .select("forbidden_topics,content_dos,content_donts,required_disclosures,preferred_content_themes,notes")
+        .eq("brand_id", brand_id)
+        .limit(1)
+        .execute()
+    )
+    brand_guidelines = guidelines_result.data[0] if guidelines_result.data else None
+
+    # ── 3. Scrape + Transcribe (if video URL present) ─────────────────
+    transcript = None
+    has_video = content_url and ("instagram.com/reel/" in content_url or "instagram.com/p/" in content_url)
+
+    if has_video:
+        try:
+            brightdata_token = _require_env("BRIGHTDATA_API_TOKEN")
+            openai_key = _require_env("OPENAI_API_KEY")
+
+            bd_client = BrightdataClient(api_token=brightdata_token)
+            post_data = scrape_single_post(bd_client, content_url)
+
+            if not post_data or not post_data.get("video_url"):
+                logger.warning(f"No video_url found for {content_url}")
+                _update_analysis(analysis_id, {
+                    "status": "analyzing",
+                    "error_message": "Video URL not accessible — running caption-only analysis",
+                })
+            else:
+                reel_entry = {
+                    "post_id": post_data.get("post_id", submission_id),
+                    "video_url": post_data["video_url"],
+                    "caption": post_data.get("description", ""),
+                    "length": post_data.get("length", 0),
+                }
+
+                transcripts = transcribe_reels([reel_entry], openai_key)
+                if transcripts and transcripts[0].get("transcript_text"):
+                    transcript = transcripts[0]
+                    _update_analysis(analysis_id, {
+                        "status": "analyzing",
+                        "transcript_text": transcript["transcript_text"],
+                        "transcript_segments": transcript.get("segments", []),
+                        "detected_language": transcript.get("detected_language"),
+                        "hook_text": transcript.get("hook_text"),
+                        "audio_confidence": transcript.get("avg_confidence"),
+                        "is_likely_music": transcript.get("is_likely_music", False),
+                        "reel_length_seconds": transcript.get("reel_length_seconds"),
+                    })
+                else:
+                    error_msg = transcripts[0].get("error", "Transcription returned empty") if transcripts else "Transcription failed"
+                    logger.warning(f"Transcription failed for {submission_id}: {error_msg}")
+                    _update_analysis(analysis_id, {
+                        "status": "analyzing",
+                        "error_message": f"Transcription issue: {error_msg} — running caption-only analysis",
+                    })
+
+        except Exception as e:
+            logger.error(f"Scrape/transcribe failed for {submission_id}: {e}")
+            _update_analysis(analysis_id, {
+                "status": "analyzing",
+                "error_message": f"Video processing failed: {e} — running caption-only analysis",
+            })
+    else:
+        _update_analysis(analysis_id, {"status": "analyzing"})
+
+    # ── 4. Claude analysis ────────────────────────────────────────────
+    if not transcript and not caption_text:
+        _update_analysis(analysis_id, {
+            "status": "skipped",
+            "error_message": "No transcript or caption available for analysis.",
+        })
+        _update_submission_status("skipped")
+        return
+
+    try:
+        anthropic_key = _require_env("ANTHROPIC_API_KEY")
+
+        analysis_result = analyze_submission_content(
+            transcript=transcript,
+            caption_text=caption_text,
+            brand_guidelines=brand_guidelines,
+            campaign=campaign,
+            anthropic_api_key=anthropic_key,
+        )
+
+        overall = analysis_result.get("overall", {})
+        _update_analysis(analysis_id, {
+            "status": "completed",
+            "analysis": analysis_result,
+            "overall_score": overall.get("score"),
+            "hook_strength_score": analysis_result.get("hook_strength", {}).get("score"),
+            "brand_mention_score": analysis_result.get("brand_mention", {}).get("score"),
+            "brief_compliance_score": analysis_result.get("brief_compliance", {}).get("score"),
+            "guideline_compliance_score": analysis_result.get("guideline_compliance", {}).get("score"),
+            "analysis_model": ANALYSIS_MODEL,
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+        })
+        _update_submission_status("completed")
+        logger.info(
+            f"Content analysis completed for submission {submission_id} — "
+            f"score={overall.get('score')}, rec={overall.get('recommendation')}"
+        )
+
+    except Exception as e:
+        logger.error(f"Claude analysis failed for {submission_id}: {e}")
+        _update_analysis(analysis_id, {
+            "status": "failed",
+            "error_message": str(e),
+        })
+        _update_submission_status("failed")
+        raise
+
+
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
 HANDLERS = {
     "brand_ig_scrape": handle_brand_ig_scrape,
     "creator_ig_scrape": handle_creator_ig_scrape,
+    "content_video_analysis": handle_content_video_analysis,
 }
 
 

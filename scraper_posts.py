@@ -111,10 +111,27 @@ def extract_post_metrics(
         handle: Creator's Instagram handle (to filter from brand mentions)
 
     Returns:
-        Dict containing all Tier A computed metrics
+        Dict containing all Tier A computed metrics. When `follower_count`
+        is below the low-follower threshold (100), returns a stub with
+        `data_quality_flag='low_followers'` and `avg_engagement_rate=None`
+        so downstream scoring can skip ER math instead of producing a
+        spurious 0.0.
     """
     if not posts:
         return {}
+
+    if follower_count is not None and follower_count < 100:
+        return {
+            "data_quality_flag": "low_followers",
+            "avg_engagement_rate": None,
+            "median_engagement_rate": None,
+            "posts_per_week": 0,
+            "posting_consistency_stddev_days": None,
+            "engagement_trend": "insufficient_data",
+            "_captions": [
+                p.get("description", "") for p in posts if p.get("description")
+            ],
+        }
 
     engagement_rates = []
     likes_comments_ratios = []

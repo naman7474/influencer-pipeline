@@ -1,8 +1,10 @@
 from pipeline.llm_client import (
     call_gemini_json,
-    validate_llm_response,
-    normalize_language_mix,
     PROMPT_VERSION,
+)
+from pipeline.schemas.intelligence import (
+    CaptionIntelligencePayload,
+    is_llm_failure,
 )
 
 CAPTION_ANALYSIS_PROMPT = """You are an influencer marketing analyst. Analyze the following Instagram captions from a single creator and extract structured intelligence.
@@ -128,28 +130,18 @@ def analyze_captions(
         captions_block=captions_block,
     )
 
-    result = call_gemini_json(client, prompt)
-    result = validate_llm_response(
-        result,
-        [
-            "niche_classification",
-            "tone_profile",
-            "language_analysis",
-            "cta_patterns",
-            "brand_mentions",
-            "content_themes",
-            "authenticity_signals",
-        ],
+    result = call_gemini_json(
+        client, prompt,
+        expected_schema=CaptionIntelligencePayload,
+        dimension="captions",
     )
 
-    # Normalize language mix format
-    lang_mix = (
-        result.get("language_analysis", {}).get("language_mix_percentages", {})
-    )
-    if lang_mix:
-        result["language_analysis"]["language_mix_percentages"] = (
-            normalize_language_mix(lang_mix)
-        )
+    if is_llm_failure(result):
+        # Attach non-reserved metadata so the CIP still knows how many
+        # captions were in scope when we retry offline.
+        result["_captions_analyzed"] = min(len(captions), 20)
+        result["_prompt_version"] = PROMPT_VERSION
+        return result
 
     result["_prompt_version"] = PROMPT_VERSION
     result["_captions_analyzed"] = min(len(captions), 20)

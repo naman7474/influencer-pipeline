@@ -1,7 +1,10 @@
 from pipeline.llm_client import (
     call_gemini_json,
-    validate_llm_response,
     PROMPT_VERSION,
+)
+from pipeline.schemas.intelligence import (
+    TranscriptIntelligencePayload,
+    is_llm_failure,
 )
 
 TRANSCRIPT_ANALYSIS_PROMPT = """You are an influencer content analyst specializing in video content quality. Analyze the following reel transcripts from a single Instagram creator.
@@ -135,16 +138,13 @@ Caption for context: {t.get('caption', '')[:200]}
         transcripts_block=transcripts_block,
     )
 
-    result = call_gemini_json(client, prompt)
-    result = validate_llm_response(
-        result,
-        [
-            "speaking_language",
-            "hook_analysis",
-            "brand_mention_analysis",
-            "content_depth",
-            "regional_signals",
-        ],
+    result = call_gemini_json(
+        client, prompt,
+        expected_schema=TranscriptIntelligencePayload,
+        dimension="transcripts",
     )
+    if is_llm_failure(result):
+        result["_prompt_version"] = PROMPT_VERSION
+        return result
     result["_prompt_version"] = PROMPT_VERSION
     return result

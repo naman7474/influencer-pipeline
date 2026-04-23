@@ -4,6 +4,7 @@ These tests mock all external dependencies (Supabase, BrightData, Whisper, Claud
 to verify the handler orchestration logic and error handling paths.
 """
 
+from collections import defaultdict
 from unittest.mock import MagicMock, patch
 import os
 import pytest
@@ -19,14 +20,9 @@ from pipeline.handlers import handle_content_video_analysis
 def make_mock_db():
     """Create a mock Supabase client with chainable query builder."""
     db = MagicMock()
-    tables = {}
+    tables = defaultdict(MagicMock)
 
-    def mock_table(name):
-        if name not in tables:
-            tables[name] = MagicMock()
-        return tables[name]
-
-    db.table = mock_table
+    db.table = lambda name: tables[name]
     return db, tables
 
 

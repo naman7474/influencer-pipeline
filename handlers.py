@@ -26,6 +26,7 @@ from pipeline.embeddings import (
     embed_text,
 )
 from pipeline.pipeline import build_creator_intelligence_profile
+from pipeline.calibration import load_er_benchmarks
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +219,29 @@ def _trigger_matching_compute(brand_id: str) -> None:
         logger.warning(f"Failed to trigger matching recompute: {e}")
 
 
+def _trigger_creator_recompute(creator_id: str) -> None:
+    """Fire-and-forget call to /api/matching/recompute-creator for
+    standalone creator pipeline runs (no parent brand fanout)."""
+    base = os.environ.get("WEB_APP_URL")
+    secret = os.environ.get("MATCHING_COMPUTE_SECRET")
+    if not base or not secret:
+        logger.warning(
+            "WEB_APP_URL or MATCHING_COMPUTE_SECRET not set; skipping creator recompute"
+        )
+        return
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "X-Worker-Secret": secret,
+        }
+        url = f"{base.rstrip('/')}/api/matching/recompute-creator"
+        with httpx.Client(timeout=10.0) as client:
+            client.post(url, json={"creator_id": creator_id}, headers=headers)
+        logger.info(f"Triggered creator recompute for creator {creator_id}")
+    except Exception as e:
+        logger.warning(f"Failed to trigger creator recompute: {e}")
+
+
 # ── Handlers ────────────────────────────────────────────────────────────────
 
 
@@ -249,6 +273,7 @@ def handle_brand_ig_scrape(db, job: dict) -> None:
         brightdata_token=brightdata_token,
         gemini_api_key=gemini_key,
         openai_api_key=openai_key,
+        er_benchmarks=load_er_benchmarks(db),
     )
     if cip.get("error"):
         raise RuntimeError(f"CIP failed for brand @{handle}: {cip['error']}")
@@ -319,6 +344,7 @@ def handle_creator_ig_scrape(db, job: dict) -> None:
         brightdata_token=brightdata_token,
         gemini_api_key=gemini_key,
         openai_api_key=openai_key,
+        er_benchmarks=load_er_benchmarks(db),
     )
     if cip.get("error"):
         raise RuntimeError(f"CIP failed for creator @{handle}: {cip['error']}")
@@ -330,9 +356,14 @@ def handle_creator_ig_scrape(db, job: dict) -> None:
         embedding = embed_text(embedding_input, openai_key)
         _update_creator_embedding(db, creator_id, embedding)
 
-    # If this was the last sibling in the fanout, recompute matches.
+    # If this creator was part of a brand fanout, trigger a brand-scoped
+    # recompute when the whole fanout is done. Otherwise (standalone
+    # creator run) trigger a per-creator recompute so any brand with
+    # Shopify data picks up the new score.
     if parent_brand_id and _siblings_all_terminal(db, parent_brand_id):
         _trigger_matching_compute(parent_brand_id)
+    elif not parent_brand_id and creator_id:
+        _trigger_creator_recompute(creator_id)
 
 
 # ── Content Video Analysis ─────────────────────────────────────────────────

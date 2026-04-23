@@ -23,13 +23,24 @@ def scrape_profiles(
     return client.trigger_and_wait(DATASET_PROFILES, payload)
 
 
+LOW_FOLLOWER_CUTOFF = 100
+
+
 def extract_profile_metrics(raw_profile: dict) -> dict:
     """
     Extract and compute Tier A profile-level metrics from raw Brightdata response.
+
+    Emits a `data_quality_flags` list that downstream scorers consult:
+      - "low_followers": < 100 followers, ER math is noise; we still
+        extract but downstream will skip the ER sub-score.
     """
-    followers = raw_profile.get("followers", 0)
-    following = raw_profile.get("following", 0)
-    posts_count = raw_profile.get("posts_count", 0)
+    followers = raw_profile.get("followers", 0) or 0
+    following = raw_profile.get("following", 0) or 0
+    posts_count = raw_profile.get("posts_count", 0) or 0
+
+    data_quality_flags: list[str] = []
+    if followers < LOW_FOLLOWER_CUTOFF:
+        data_quality_flags.append("low_followers")
 
     return {
         # --- Identity ---
@@ -64,6 +75,8 @@ def extract_profile_metrics(raw_profile: dict) -> dict:
         # --- Contact Info ---
         "email": raw_profile.get("contact_email"),
         "phone": raw_profile.get("contact_phone_number"),
+        # --- Data quality signalling ---
+        "data_quality_flags": data_quality_flags,
     }
 
 

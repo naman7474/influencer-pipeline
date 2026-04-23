@@ -10,7 +10,8 @@ request handler.
 Endpoints:
   POST /enqueue            — idempotent job insert (called by web layer)
   POST /process-next-job   — cron tick: claim + run one queued job
-  POST /recover-stale-jobs — every 5m: re-queue jobs stuck in running > 15m
+  POST /recover-stale-jobs — every 5m: re-queue jobs stuck in running past
+                             their per-job-type timeout (see JOB_TYPE_TIMEOUTS)
   GET  /health             — liveness
 
 Auth: all mutating endpoints require X-Worker-Secret == PIPELINE_WORKER_SECRET.
@@ -35,7 +36,29 @@ logging.basicConfig(
 )
 logger = logging.getLogger("pipeline.api")
 
-STALE_RUNNING_MINUTES = 15
+import json as _stale_json
+
+# Per-job-type stale-running timeouts. Full pipeline runs can take 30+ min
+# (Brightdata poll timeout is 900s per scrape × several scrapes), so a
+# single hardcoded 15 min ceiling spuriously recovered healthy jobs.
+DEFAULT_STALE_MINUTES = 30
+JOB_TYPE_TIMEOUTS: dict[str, int] = {
+    "brand_ig_scrape": 45,
+    "creator_ig_scrape": 45,
+    "content_video_analysis": 20,
+    "shopify_sync": 15,
+    "shopify_geo_sync": 30,
+    "brand_matching": 10,
+    "creator_match_recompute": 10,
+}
+
+# Env override: STALE_JOB_TIMEOUTS_JSON='{"brand_ig_scrape": 60, ...}'
+_override = os.environ.get("STALE_JOB_TIMEOUTS_JSON")
+if _override:
+    try:
+        JOB_TYPE_TIMEOUTS.update(_stale_json.loads(_override))
+    except Exception:  # pragma: no cover
+        logger.warning("Invalid STALE_JOB_TIMEOUTS_JSON; ignoring")
 
 app = FastAPI(title="Influencer Pipeline Worker")
 
@@ -163,32 +186,76 @@ def process_next_job(_: None = Depends(_auth)) -> Response:
 
 
 @app.post("/recover-stale-jobs")
-def recover_stale_jobs(_: None = Depends(_auth)) -> dict[str, int]:
-    """Re-queue any jobs stuck in `running` past STALE_RUNNING_MINUTES."""
-    db = _get_db()
-    cutoff = (
-        datetime.now(timezone.utc) - timedelta(minutes=STALE_RUNNING_MINUTES)
-    ).isoformat()
+def recover_stale_jobs(_: None = Depends(_auth)) -> dict[str, Any]:
+    """Re-queue jobs stuck in `running` past their per-job-type timeout.
 
-    stale = (
+    Runs one lookup per job_type so we don't apply the same cutoff to a
+    fast `brand_matching` job and a slow `brand_ig_scrape` that legitimately
+    takes half an hour.
+    """
+    db = _get_db()
+    now_ts = datetime.now(timezone.utc)
+    recovered_by_type: dict[str, int] = {}
+    total = 0
+
+    known_types = set(JOB_TYPE_TIMEOUTS.keys())
+
+    # Process each configured job_type with its own cutoff.
+    for job_type, minutes in JOB_TYPE_TIMEOUTS.items():
+        cutoff = (now_ts - timedelta(minutes=minutes)).isoformat()
+        stale = (
+            db.table("background_jobs")
+            .select("id")
+            .eq("status", "running")
+            .eq("job_type", job_type)
+            .lte("locked_at", cutoff)
+            .execute()
+        )
+        ids = [r["id"] for r in (stale.data or [])]
+        if not ids:
+            continue
+        db.table("background_jobs").update(
+            {
+                "status": "queued",
+                "locked_at": None,
+                "locked_by": None,
+                "updated_at": now_ts.isoformat(),
+            }
+        ).in_("id", ids).execute()
+        recovered_by_type[job_type] = len(ids)
+        total += len(ids)
+
+    # Catch-all for unknown job_types so a misconfigured row isn't stuck
+    # forever. Uses DEFAULT_STALE_MINUTES.
+    default_cutoff = (
+        now_ts - timedelta(minutes=DEFAULT_STALE_MINUTES)
+    ).isoformat()
+    catchall = (
         db.table("background_jobs")
-        .select("id")
+        .select("id, job_type")
         .eq("status", "running")
-        .lte("locked_at", cutoff)
+        .lte("locked_at", default_cutoff)
         .execute()
     )
-    ids = [r["id"] for r in (stale.data or [])]
-    if not ids:
-        return {"recovered": 0}
+    unknown_ids = [
+        r["id"]
+        for r in (catchall.data or [])
+        if r.get("job_type") not in known_types
+    ]
+    if unknown_ids:
+        db.table("background_jobs").update(
+            {
+                "status": "queued",
+                "locked_at": None,
+                "locked_by": None,
+                "updated_at": now_ts.isoformat(),
+            }
+        ).in_("id", unknown_ids).execute()
+        recovered_by_type["_unknown"] = len(unknown_ids)
+        total += len(unknown_ids)
 
-    now = datetime.now(timezone.utc).isoformat()
-    db.table("background_jobs").update(
-        {
-            "status": "queued",
-            "locked_at": None,
-            "locked_by": None,
-            "updated_at": now,
-        }
-    ).in_("id", ids).execute()
-    logger.warning(f"Recovered {len(ids)} stale jobs")
-    return {"recovered": len(ids)}
+    if total:
+        logger.warning(
+            f"Recovered {total} stale jobs: {recovered_by_type}"
+        )
+    return {"recovered": total, "by_type": recovered_by_type}

@@ -81,7 +81,9 @@ def transcribe_reels(
             )
 
             # Step 5: Detect if transcript is likely background music
-            result["is_likely_music"] = _is_likely_music(result)
+            music_flag, music_confidence = _classify_music(result)
+            result["is_likely_music"] = music_flag
+            result["music_detection_confidence"] = music_confidence
 
             results.append(result)
             logger.info(
@@ -118,37 +120,40 @@ def _extract_hook(
 
 
 def _is_likely_music(transcript_result: dict) -> bool:
-    """
-    Heuristic to flag transcripts that are background music/song lyrics
-    rather than the creator's actual speech.
+    """Legacy wrapper — keeps the boolean API callers still use."""
+    flag, _ = _classify_music(transcript_result)
+    return flag
 
-    Signals:
-    - Whisper outputs 🎶/music markers
-    - Very low confidence (Whisper struggles with music)
-    - Very few words relative to reel length (music has sparse "lyrics")
-    - Detected language doesn't match caption language (e.g., Spanish song
-      over an Indian creator's visual-only reel)
+
+def _classify_music(transcript_result: dict) -> tuple[bool, float]:
     """
-    text = transcript_result.get("transcript_text", "")
-    conf = transcript_result.get("avg_confidence", 0)
-    reel_length = transcript_result.get("reel_length_seconds", 0)
+    Heuristic music/speech classifier. Returns (is_music, confidence).
+
+    Confidence is the strength of the classification in [0, 1]:
+      - 0.95+ : explicit music marker (🎶/♪/♫ in text) — near certain
+      - 0.75  : low Whisper confidence + sparse words — likely music
+      - 0.65  : short reel, sparse words, low confidence
+      - 0.00  : none of the above triggered
+    Downstream scorers can weight transcripts by this uncertainty
+    instead of treating the boolean as ground truth.
+    """
+    text = transcript_result.get("transcript_text", "") or ""
+    conf = transcript_result.get("avg_confidence", 0) or 0
+    reel_length = transcript_result.get("reel_length_seconds", 0) or 0
     word_count = len(text.split())
     words_per_second = word_count / max(reel_length, 1)
 
-    # Explicit music markers from Whisper
     music_markers = ["🎶", "♪", "music", "outro", "♫"]
     if any(m in text.lower() for m in music_markers):
-        return True
+        return True, 0.95
 
-    # Very low confidence + sparse words = likely music
     if conf < 0.50 and words_per_second < 1.5:
-        return True
+        return True, 0.75
 
-    # Short reel with very few words and low confidence
     if reel_length <= 10 and word_count <= 5 and conf < 0.60:
-        return True
+        return True, 0.65
 
-    return False
+    return False, 0.0
 
 
 def _avg_segment_confidence(segments) -> float:

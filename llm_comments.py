@@ -1,7 +1,10 @@
 from pipeline.llm_client import (
     call_gemini_json,
-    validate_llm_response,
     PROMPT_VERSION,
+)
+from pipeline.schemas.intelligence import (
+    AudienceIntelligencePayload,
+    is_llm_failure,
 )
 
 COMMENT_ANALYSIS_PROMPT = """You are an audience intelligence analyst. Analyze the following Instagram comments to infer audience characteristics for creator @{handle}.
@@ -142,17 +145,13 @@ def analyze_comments(
         hour_distribution=hour_str,
     )
 
-    result = call_gemini_json(client, prompt)
-    result = validate_llm_response(
-        result,
-        [
-            "audience_language_distribution",
-            "audience_geography_inference",
-            "audience_authenticity",
-            "audience_sentiment",
-            "audience_demographics_inference",
-            "engagement_quality",
-        ],
+    result = call_gemini_json(
+        client, prompt,
+        expected_schema=AudienceIntelligencePayload,
+        dimension="comments",
     )
+    if is_llm_failure(result):
+        result["_prompt_version"] = PROMPT_VERSION
+        return result
     result["_prompt_version"] = PROMPT_VERSION
     return result

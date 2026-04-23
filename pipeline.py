@@ -23,8 +23,16 @@ from pipeline.llm_client import init_gemini
 from pipeline.llm_captions import analyze_captions
 from pipeline.llm_transcripts import analyze_transcripts
 from pipeline.llm_comments import analyze_comments
+from pipeline.confidence import (
+    CoverageTracker,
+    CPI_WEIGHTS,
+    pull as _pull,
+)
+from pipeline.fraud_flags import compute_fraud_flags, flag_codes
 
 logger = logging.getLogger(__name__)
+
+PIPELINE_VERSION = "1.1"
 
 
 def build_creator_intelligence_profile(
@@ -36,6 +44,7 @@ def build_creator_intelligence_profile(
     num_reels: int = 5,
     num_comment_posts: int = 5,
     days_back: int = 90,
+    er_benchmarks: dict | None = None,
 ) -> dict:
     """
     Full pipeline: Scrape -> Transcribe -> Analyse -> Compute -> Return CIP.
@@ -61,7 +70,7 @@ def build_creator_intelligence_profile(
 
     cip = {
         "profile_url": profile_url,
-        "pipeline_version": "1.0",
+        "pipeline_version": PIPELINE_VERSION,
         "scraped_at": datetime.now().isoformat(),
         "data_provenance": "brightdata_scraper_api",
     }
@@ -217,7 +226,10 @@ def build_creator_intelligence_profile(
 
     # ── STEP 6: Compute Final Scores ──
     logger.info("  [Step 6/6] Computing Creator Performance Index...")
-    cip["scores"] = compute_creator_scores(cip)
+    llm_status = _summarize_llm_status(cip)
+    cip["scores"] = compute_creator_scores(
+        cip, llm_status=llm_status, er_benchmarks=er_benchmarks
+    )
 
     logger.info(f"CIP complete for @{handle} — CPI: {cip['scores']['cpi']}")
     return cip
@@ -243,7 +255,41 @@ def _classify_audio_quality(transcripts: list[dict]) -> str:
         return "raw"
 
 
-def compute_creator_scores(cip: dict) -> dict:
+DEFAULT_ER_BENCHMARKS: dict[str, float] = {
+    "nano": 0.06,
+    "micro": 0.04,
+    "mid": 0.025,
+    "macro": 0.015,
+    "mega": 0.01,
+}
+
+
+def _summarize_llm_status(cip: dict) -> dict:
+    """Translate the CIP's LLM outputs into a success map.
+
+    A dimension is counted as succeeded iff the corresponding intel
+    block is present and does not carry the `_llm_failure` sentinel
+    (emitted by the LLMFailure wrapper in W2).
+    """
+    def _ok(block):
+        if not isinstance(block, dict):
+            return bool(block)
+        if block.get("_llm_failure"):
+            return False
+        return bool(block)
+
+    return {
+        "captions": _ok(cip.get("caption_intelligence")),
+        "transcripts": _ok(cip.get("transcript_intelligence")),
+        "comments": _ok(cip.get("audience_intelligence")),
+    }
+
+
+def compute_creator_scores(
+    cip: dict,
+    llm_status: dict | None = None,
+    er_benchmarks: dict | None = None,
+) -> dict:
     """
     Compute the Creator Performance Index (CPI) and sub-scores.
 
@@ -253,42 +299,87 @@ def compute_creator_scores(cip: dict) -> dict:
     - Audience Authenticity: 20%
     - Growth Trajectory: 15%
     - Professionalism: 10%
+
+    The math is unchanged from v1.0 — this version additionally
+    records which inputs were present vs. defaulted so the returned
+    scores carry a `confidence` envelope downstream consumers can
+    gate on.
     """
-    scores = {}
+    scores: dict = {}
+    tracker = CoverageTracker()
+    llm_status = llm_status or {}
+
+    # Record LLM dimension success/failure up front so every
+    # defaulted downstream key can be labelled with the real reason.
+    for dim in ("captions", "transcripts", "comments"):
+        if dim in llm_status:
+            if llm_status[dim]:
+                tracker.mark_llm_success(dim)
+            else:
+                err_msg = (
+                    (cip.get(f"{_dim_to_cip_key(dim)}") or {}).get(
+                        "error", "llm_failure"
+                    )
+                )
+                tracker.mark_llm_failure(dim, str(err_msg))
+
+    # Surface any upstream data-quality flags from the profile / posts
+    # scrapers (set by W9). They do not affect math but ride along in
+    # the confidence envelope.
+    for flag in cip.get("profile", {}).get("data_quality_flags", []) or []:
+        tracker.add_data_quality_flag(flag)
+    posts_flag = cip.get("posts", {}).get("data_quality_flag")
+    if posts_flag:
+        tracker.add_data_quality_flag(posts_flag)
 
     # --- Engagement Quality (0-100) ---
     # Tier-adjusted ER benchmarks: what counts as "excellent" varies by size
     tier = cip.get("profile", {}).get("tier", "micro")
-    er_benchmarks = {
-        "nano": 0.06,
-        "micro": 0.04,
-        "mid": 0.025,
-        "macro": 0.015,
-        "mega": 0.01,
-    }
-    er_benchmark = er_benchmarks.get(tier, 0.03)
+    benchmarks = er_benchmarks or DEFAULT_ER_BENCHMARKS
+    er_benchmark = benchmarks.get(tier, 0.03)
 
-    avg_er = cip.get("posts", {}).get("avg_engagement_rate", 0)
-    reply_rate = cip.get("comments", {}).get("creator_reply_rate", 0)
-    rewatch = cip.get("reels", {}).get("avg_rewatch_rate", 0)
+    posts_flag = cip.get("posts", {}).get("data_quality_flag")
+    avg_er = _pull(
+        cip, ["posts", "avg_engagement_rate"],
+        default=0, key="avg_er", tracker=tracker,
+    )
+    # Low-followers stub emits None — re-tag with the real reason.
+    if avg_er is None or posts_flag == "low_followers":
+        tracker.mark_default("avg_er", reason="low_followers")
+        avg_er = 0
+    reply_rate = _pull(
+        cip, ["comments", "creator_reply_rate"],
+        default=0, key="reply_rate", tracker=tracker,
+    )
+    rewatch = _pull(
+        cip, ["reels", "avg_rewatch_rate"],
+        default=0, key="rewatch", tracker=tracker,
+    )
 
-    # LLM-derived engagement quality (has good variance 0.1-0.9)
-    llm_eq = (
-        cip.get("audience_intelligence", {})
-        .get("engagement_quality", {})
-        .get("quality_score")
+    # LLM-derived engagement quality — explicit None is the "missing"
+    # sentinel the old code already handled.
+    llm_eq = _pull(
+        cip,
+        ["audience_intelligence", "engagement_quality", "quality_score"],
+        default=None, key="llm_engagement_quality", tracker=tracker,
     )
-    # LLM conversation depth and community feel
-    conv_depth = (
-        cip.get("audience_intelligence", {})
-        .get("engagement_quality", {})
-        .get("conversation_depth", "shallow")
+    conv_depth = _pull(
+        cip,
+        ["audience_intelligence", "engagement_quality", "conversation_depth"],
+        default="shallow", key="conv_depth", tracker=tracker,
     )
-    community = (
-        cip.get("audience_intelligence", {})
-        .get("engagement_quality", {})
-        .get("community_feel", "weak")
+    community = _pull(
+        cip,
+        ["audience_intelligence", "engagement_quality", "community_feel"],
+        default="weak", key="community_feel", tracker=tracker,
     )
+
+    # If the comments LLM dimension failed, re-tag every engagement-quality
+    # LLM key with reason=llm_failure (pull() logs them as "missing").
+    if llm_status.get("comments") is False:
+        for k in ("llm_engagement_quality", "conv_depth", "community_feel"):
+            if tracker.is_defaulted(k):
+                tracker.mark_default(k, reason="llm_failure")
 
     er_score = min(avg_er / er_benchmark, 1.0) * 40
     reply_score = min(reply_rate / 0.5, 1.0) * 10
@@ -314,27 +405,33 @@ def compute_creator_scores(cip: dict) -> dict:
     )
 
     # --- Content Quality (0-100) ---
-    hook_quality = (
-        cip.get("transcript_intelligence", {})
-        .get("hook_analysis", {})
-        .get("avg_hook_quality", 0.5)
+    hook_quality = _pull(
+        cip,
+        ["transcript_intelligence", "hook_analysis", "avg_hook_quality"],
+        default=0.5, key="hook_quality", tracker=tracker,
     )
-    consistency = cip.get("posts", {}).get(
-        "posting_consistency_stddev_days", 10
+    consistency = _pull(
+        cip, ["posts", "posting_consistency_stddev_days"],
+        default=10, key="consistency_stddev", tracker=tracker,
     )
-    posts_per_week = cip.get("posts", {}).get("posts_per_week", 0)
-
-    # LLM content signals
-    storytelling = (
-        cip.get("transcript_intelligence", {})
-        .get("content_depth", {})
-        .get("storytelling_score", 0.5)
+    posts_per_week = _pull(
+        cip, ["posts", "posts_per_week"],
+        default=0, key="posts_per_week", tracker=tracker,
     )
-    edu_density = (
-        cip.get("transcript_intelligence", {})
-        .get("content_depth", {})
-        .get("educational_density", 0.3)
+    storytelling = _pull(
+        cip,
+        ["transcript_intelligence", "content_depth", "storytelling_score"],
+        default=0.5, key="storytelling", tracker=tracker,
     )
+    edu_density = _pull(
+        cip,
+        ["transcript_intelligence", "content_depth", "educational_density"],
+        default=0.3, key="educational_density", tracker=tracker,
+    )
+    if llm_status.get("transcripts") is False:
+        for k in ("hook_quality", "storytelling", "educational_density"):
+            if tracker.is_defaulted(k):
+                tracker.mark_default(k, reason="llm_failure")
 
     hook_score = hook_quality * 25
     consistency_score = max(0, (1 - min(consistency / 14, 1))) * 20
@@ -348,19 +445,25 @@ def compute_creator_scores(cip: dict) -> dict:
     )
 
     # --- Audience Authenticity (0-100) ---
-    auth_score_raw = (
-        cip.get("audience_intelligence", {})
-        .get("audience_authenticity", {})
-        .get("authenticity_score", 0.5)
+    auth_score_raw = _pull(
+        cip,
+        ["audience_intelligence", "audience_authenticity", "authenticity_score"],
+        default=0.5, key="authenticity_score", tracker=tracker,
     )
-    substantive_pct = (
-        cip.get("audience_intelligence", {})
-        .get("audience_authenticity", {})
-        .get("substantive_comment_percentage", 0.1)
+    substantive_pct = _pull(
+        cip,
+        ["audience_intelligence", "audience_authenticity",
+         "substantive_comment_percentage"],
+        default=0.1, key="substantive_pct", tracker=tracker,
     )
-    follower_ratio = cip.get("profile", {}).get(
-        "follower_following_ratio", 1
+    follower_ratio = _pull(
+        cip, ["profile", "follower_following_ratio"],
+        default=1, key="follower_ratio", tracker=tracker,
     )
+    if llm_status.get("comments") is False:
+        for k in ("authenticity_score", "substantive_pct"):
+            if tracker.is_defaulted(k):
+                tracker.mark_default(k, reason="llm_failure")
     ratio_signal = min(follower_ratio / 50, 1.0)
 
     scores["audience_authenticity"] = round(
@@ -371,7 +474,17 @@ def compute_creator_scores(cip: dict) -> dict:
     )
 
     # --- Growth Trajectory (0-100) ---
-    trend = cip.get("posts", {}).get("engagement_trend", "stable")
+    # Treat "insufficient_data" as a present-but-insufficient sentinel
+    # so downstream can distinguish it from a real "stable".
+    trend = _pull(
+        cip, ["posts", "engagement_trend"],
+        default="stable", key="engagement_trend", tracker=tracker,
+        present_predicate=lambda v: v != "insufficient_data",
+    )
+    if trend == "insufficient_data":
+        tracker.mark_default(
+            "engagement_trend", reason="fewer_than_4_posts"
+        )
     trend_map = {
         "growing": 80,
         "stable": 50,
@@ -381,14 +494,27 @@ def compute_creator_scores(cip: dict) -> dict:
     scores["growth_trajectory"] = trend_map.get(trend, 50)
 
     # --- Professionalism (0-100) ---
-    is_business = cip.get("profile", {}).get("is_business", False)
-    is_verified = cip.get("profile", {}).get("is_verified", False)
-    has_email = bool(cip.get("profile", {}).get("email"))
+    is_business = _pull(
+        cip, ["profile", "is_business"],
+        default=False, key="is_business", tracker=tracker,
+    )
+    is_verified = _pull(
+        cip, ["profile", "is_verified"],
+        default=False, key="is_verified", tracker=tracker,
+    )
+    email_value = _pull(
+        cip, ["profile", "email"],
+        default=None, key="has_email", tracker=tracker,
+    )
+    has_email = bool(email_value)
 
     # Use Whisper confidence for audio quality instead of LLM guess
-    audio_quality = _classify_audio_quality(
-        cip.get("transcripts", [])
-    )
+    transcripts_list = cip.get("transcripts") or []
+    audio_quality = _classify_audio_quality(transcripts_list)
+    if transcripts_list:
+        tracker.mark_present("audio_quality")
+    else:
+        tracker.mark_default("audio_quality", reason="no_transcripts")
     quality_map = {
         "professional": 30,
         "semi_professional": 20,
@@ -406,15 +532,40 @@ def compute_creator_scores(cip: dict) -> dict:
 
     # --- COMPOSITE CPI ---
     scores["cpi"] = round(
-        scores["engagement_quality"] * 0.30
-        + scores["content_quality"] * 0.25
-        + scores["audience_authenticity"] * 0.20
-        + scores["growth_trajectory"] * 0.15
-        + scores["professionalism"] * 0.10,
+        scores["engagement_quality"] * CPI_WEIGHTS["engagement_quality"]
+        + scores["content_quality"] * CPI_WEIGHTS["content_quality"]
+        + scores["audience_authenticity"] * CPI_WEIGHTS["audience_authenticity"]
+        + scores["growth_trajectory"] * CPI_WEIGHTS["growth_trajectory"]
+        + scores["professionalism"] * CPI_WEIGHTS["professionalism"],
         1,
     )
 
+    # --- Fraud flags (sub-score weights untouched) ---
+    fraud = compute_fraud_flags(cip)
+    cip["fraud_flags"] = fraud
+    scores["fraud_flag_codes"] = flag_codes(fraud)
+    # Full payload ridealong for persistence; the engine reads codes only.
+    scores["_fraud_flags_full"] = fraud
+
+    envelope = tracker.to_dict(subscore_weights=CPI_WEIGHTS)
+    scores["confidence"] = envelope
+    scores["coverage_percentage"] = round(
+        envelope["overall_coverage"] * 100, 2
+    )
+    scores["confidence_tier"] = envelope["tier"]
+    scores["missing_inputs"] = envelope["missing_inputs"]
+    scores["llm_calls_succeeded"] = envelope["llm_calls_succeeded"]
+    scores["data_quality_flags"] = envelope["data_quality_flags"]
+
     return scores
+
+
+def _dim_to_cip_key(dim: str) -> str:
+    return {
+        "captions": "caption_intelligence",
+        "transcripts": "transcript_intelligence",
+        "comments": "audience_intelligence",
+    }[dim]
 
 
 def clean_cip_for_export(cip: dict) -> dict:

@@ -5,15 +5,24 @@ Uses the Supabase Python client to upsert scraped data
 and computed intelligence into the schema defined in db-schema.md.
 """
 
+import json
 import logging
+import os
 import socket
 from datetime import datetime
 
 from supabase import create_client, Client
 
+from pipeline.media_store import persist_avatar, persist_thumbnail
 from pipeline.scraper_posts import _normalize_content_type
 
 logger = logging.getLogger(__name__)
+
+# Opt-in flag: route the pure-DB CIP writes through the transactional
+# RPC defined in migration 036 instead of the per-table Python inserts.
+USE_TX_RPC = os.environ.get("PIPELINE_USE_TX_RPC", "").lower() in (
+    "1", "true", "yes",
+)
 
 
 def init_supabase(url: str, service_key: str) -> Client:
@@ -34,6 +43,10 @@ def upsert_creator(db: Client, profile: dict) -> str:
     elif ext_url == "":
         ext_url = None
 
+    # Re-host avatar in Supabase Storage so the URL never expires
+    raw_avatar = profile.get("avatar_url")
+    persisted_avatar = persist_avatar(db, profile["handle"], raw_avatar) if raw_avatar else None
+
     row = {
         "handle": profile["handle"],
         "instagram_id": profile.get("instagram_id"),
@@ -41,7 +54,7 @@ def upsert_creator(db: Client, profile: dict) -> str:
         "display_name": profile.get("display_name"),
         "biography": profile.get("bio"),
         "external_url": ext_url,
-        "avatar_url": profile.get("avatar_url"),
+        "avatar_url": persisted_avatar or raw_avatar,
         "category": profile.get("category"),
         "city": profile.get("city"),
         "country": profile.get("country"),
@@ -88,6 +101,10 @@ def upsert_posts(
         if not post_id and not url:
             continue
 
+        # Re-host thumbnail in Supabase Storage so the URL never expires
+        raw_thumb = post.get("thumbnail")
+        persisted_thumb = persist_thumbnail(db, post_id, raw_thumb) if raw_thumb else None
+
         row = {
             "creator_id": creator_id,
             "post_id": post_id,
@@ -107,7 +124,7 @@ def upsert_posts(
             "tagged_users": post.get("tagged_users") or [],
             "photos": post.get("photos") or [],
             "videos": post.get("videos") or [],
-            "thumbnail_url": post.get("thumbnail"),
+            "thumbnail_url": persisted_thumb or raw_thumb,
             "display_url": post.get("display_url"),
             "date_posted": post.get("date_posted"),
         }
@@ -134,10 +151,12 @@ def insert_creator_scores(
     post_metrics: dict,
     reel_metrics: dict,
     comment_metrics: dict,
+    pipeline_version: str = "1.1",
 ) -> None:
     """Insert computed CPI scores + all Tier A/B metrics."""
     row = {
         "creator_id": creator_id,
+        "pipeline_version": pipeline_version,
         # CPI sub-scores
         "engagement_quality": scores.get("engagement_quality", 0),
         "content_quality": scores.get("content_quality", 0),
@@ -145,6 +164,16 @@ def insert_creator_scores(
         "growth_trajectory": scores.get("growth_trajectory", 0),
         "professionalism": scores.get("professionalism", 0),
         "cpi": scores.get("cpi", 0),
+        # Confidence envelope (W1)
+        "confidence": scores.get("confidence", {}),
+        "coverage_percentage": scores.get("coverage_percentage"),
+        "confidence_tier": scores.get("confidence_tier", "low"),
+        "missing_inputs": scores.get("missing_inputs", []),
+        "llm_calls_succeeded": scores.get("llm_calls_succeeded", {}),
+        "data_quality_flags": scores.get("data_quality_flags", []),
+        # Fraud flags (W4)
+        "fraud_flags": scores.get("_fraud_flags_full", []),
+        "fraud_flag_codes": scores.get("fraud_flag_codes", []),
         # Post metrics (Tier A)
         "avg_engagement_rate": post_metrics.get("avg_engagement_rate"),
         "median_engagement_rate": post_metrics.get("median_engagement_rate"),
@@ -188,10 +217,55 @@ def insert_creator_scores(
         ),
     }
 
-    db.table("creator_scores").insert(row).execute()
+    db.table("creator_scores").upsert(
+        row,
+        on_conflict="creator_id,pipeline_version,computed_at_date",
+    ).execute()
     logger.info(
-        f"Inserted scores for {creator_id} — CPI: {scores.get('cpi')}"
+        f"Upserted scores for {creator_id} — CPI: {scores.get('cpi')} "
+        f"(tier={scores.get('confidence_tier')}, "
+        f"coverage={scores.get('coverage_percentage')}%)"
     )
+
+
+def _build_data_quality_envelope(
+    intel: dict,
+    *,
+    expected_keys: list[str],
+    sample_size: int | None,
+    schema_version: str = "1.0",
+) -> dict:
+    """Build the data_quality envelope persisted on an intelligence row.
+
+    W1 version: relies on top-level key presence to estimate coverage.
+    W2 will replace this with Pydantic-validator-aware coverage.
+    """
+    if intel.get("_llm_failure"):
+        return {
+            "confidence": 0.0,
+            "coverage_percentage": 0,
+            "was_defaulted": True,
+            "missing_fields": list(expected_keys),
+            "sample_size": sample_size or 0,
+            "schema_version": schema_version,
+            "llm_failure": True,
+            "error": intel.get("error", "llm_failure"),
+        }
+
+    present = [k for k in expected_keys if intel.get(k)]
+    missing = [k for k in expected_keys if not intel.get(k)]
+    coverage = (
+        round(len(present) / len(expected_keys), 3)
+        if expected_keys else 1.0
+    )
+    return {
+        "confidence": coverage,
+        "coverage_percentage": round(coverage * 100),
+        "was_defaulted": len(missing) > 0,
+        "missing_fields": missing,
+        "sample_size": sample_size or 0,
+        "schema_version": schema_version,
+    }
 
 
 def insert_caption_intelligence(
@@ -235,10 +309,22 @@ def insert_caption_intelligence(
         "engagement_bait_score": auth.get("engagement_bait_score"),
         "raw_llm_response": intel,
         "posts_analyzed": intel.get("_captions_analyzed", 0),
+        "data_quality": _build_data_quality_envelope(
+            intel,
+            expected_keys=[
+                "niche_classification", "tone_profile", "language_analysis",
+                "cta_patterns", "brand_mentions", "content_themes",
+                "authenticity_signals",
+            ],
+            sample_size=intel.get("_captions_analyzed"),
+        ),
     }
 
-    db.table("caption_intelligence").insert(row).execute()
-    logger.info(f"Inserted caption intelligence for {creator_id}")
+    db.table("caption_intelligence").upsert(
+        row,
+        on_conflict="creator_id,analyzed_at_date",
+    ).execute()
+    logger.info(f"Upserted caption intelligence for {creator_id}")
 
 
 def insert_transcript_intelligence(
@@ -288,10 +374,21 @@ def insert_transcript_intelligence(
         # Meta
         "raw_llm_response": intel,
         "reels_analyzed": len(hooks.get("hooks", [])),
+        "data_quality": _build_data_quality_envelope(
+            intel,
+            expected_keys=[
+                "speaking_language", "hook_analysis", "content_depth",
+                "audio_production", "regional_signals",
+            ],
+            sample_size=len(hooks.get("hooks", [])) or None,
+        ),
     }
 
-    db.table("transcript_intelligence").insert(row).execute()
-    logger.info(f"Inserted transcript intelligence for {creator_id}")
+    db.table("transcript_intelligence").upsert(
+        row,
+        on_conflict="creator_id,analyzed_at_date",
+    ).execute()
+    logger.info(f"Upserted transcript intelligence for {creator_id}")
 
 
 def insert_audience_intelligence(
@@ -339,10 +436,25 @@ def insert_audience_intelligence(
         "conversation_depth": eng.get("conversation_depth"),
         "community_strength": eng.get("community_feel"),
         "raw_llm_response": intel,
+        "data_quality": _build_data_quality_envelope(
+            intel,
+            expected_keys=[
+                "audience_language_distribution",
+                "audience_geography_inference",
+                "audience_authenticity",
+                "audience_sentiment",
+                "audience_demographics_inference",
+                "engagement_quality",
+            ],
+            sample_size=intel.get("_comments_analyzed"),
+        ),
     }
 
-    db.table("audience_intelligence").insert(row).execute()
-    logger.info(f"Inserted audience intelligence for {creator_id}")
+    db.table("audience_intelligence").upsert(
+        row,
+        on_conflict="creator_id,analyzed_at_date",
+    ).execute()
+    logger.info(f"Upserted audience intelligence for {creator_id}")
 
 
 def store_full_cip(db: Client, cip: dict) -> str:
@@ -351,9 +463,17 @@ def store_full_cip(db: Client, cip: dict) -> str:
     This is the main entry point — called BEFORE _clean_internal_fields
     so we have access to _raw_posts and other internal data.
 
+    When PIPELINE_USE_TX_RPC is set, the pure-DB writes run through
+    the transactional RPC defined in migration 036. Media persistence
+    (Supabase Storage) always runs on the Python side because it is
+    not transactional with DB state.
+
     Returns the creator UUID.
     """
     profile = cip.get("profile", {})
+    if USE_TX_RPC:
+        return _store_full_cip_via_rpc(db, cip)
+
     creator_id = upsert_creator(db, profile)
 
     # Store raw posts
@@ -370,27 +490,111 @@ def store_full_cip(db: Client, cip: dict) -> str:
             post_metrics=cip.get("posts", {}),
             reel_metrics=cip.get("reels", {}),
             comment_metrics=cip.get("comments", {}),
+            pipeline_version=cip.get("pipeline_version", "1.1"),
         )
 
-    # Caption intelligence
-    if cip.get("caption_intelligence"):
-        insert_caption_intelligence(
-            db, creator_id, cip["caption_intelligence"]
-        )
+    # Caption intelligence (skip if LLM failed — nothing substantive to store)
+    cap = cip.get("caption_intelligence")
+    if cap and not (isinstance(cap, dict) and cap.get("_llm_failure")):
+        insert_caption_intelligence(db, creator_id, cap)
 
     # Transcript intelligence
-    if cip.get("transcript_intelligence"):
+    tr = cip.get("transcript_intelligence")
+    if tr and not (isinstance(tr, dict) and tr.get("_llm_failure")):
+        insert_transcript_intelligence(db, creator_id, tr)
+
+    # Audience intelligence
+    aud = cip.get("audience_intelligence")
+    if aud and not (isinstance(aud, dict) and aud.get("_llm_failure")):
+        insert_audience_intelligence(db, creator_id, aud)
+
+    logger.info(f"Stored full CIP for @{profile.get('handle')} -> {creator_id}")
+    return creator_id
+
+
+def _store_full_cip_via_rpc(db: Client, cip: dict) -> str:
+    """Transactional write path gated on PIPELINE_USE_TX_RPC.
+
+    Media persistence (Storage) runs here first, then the pure-DB
+    upserts go through the 036 RPC in a single transaction. Falls
+    back to the per-table path if the RPC is not deployed yet.
+    """
+    profile = dict(cip.get("profile") or {})
+
+    raw_avatar = profile.get("avatar_url")
+    if raw_avatar and profile.get("handle"):
+        try:
+            persisted = persist_avatar(db, profile["handle"], raw_avatar)
+            if persisted:
+                profile["avatar_url"] = persisted
+        except Exception as e:
+            logger.warning(f"persist_avatar failed, keeping raw URL: {e}")
+
+    # Copy media-hydrated profile back into the CIP before RPC call.
+    rpc_cip = dict(cip)
+    rpc_cip["profile"] = profile
+    # Strip internal-only fields; the RPC only reads declared keys but
+    # sending _raw_posts needlessly bloats the payload.
+    rpc_cip = {
+        k: v for k, v in rpc_cip.items() if not k.startswith("_")
+    }
+
+    try:
+        result = db.rpc(
+            "store_creator_cip",
+            {"p_cip": json.loads(json.dumps(rpc_cip, default=str))},
+        ).execute()
+    except Exception as e:
+        logger.error(
+            f"store_creator_cip RPC failed for @{profile.get('handle')}: {e}. "
+            "Falling back to per-table upserts."
+        )
+        # Unset the flag for this call so the fallback runs the normal path.
+        return _store_full_cip_legacy(db, cip)
+
+    creator_id = (
+        result.data if isinstance(result.data, str) else str(result.data)
+    )
+    # Posts still go through the Python path so thumbnails persist
+    # through Storage — the RPC only owns creators + intelligence.
+    raw_posts = cip.get("_raw_posts") or []
+    if raw_posts:
+        upsert_posts(db, creator_id, raw_posts)
+    logger.info(
+        f"Stored full CIP via RPC for @{profile.get('handle')} -> {creator_id}"
+    )
+    return creator_id
+
+
+def _store_full_cip_legacy(db: Client, cip: dict) -> str:
+    """Fallback path — mirrors store_full_cip without the RPC branch."""
+    profile = cip.get("profile", {})
+    creator_id = upsert_creator(db, profile)
+    raw_posts = cip.get("_raw_posts") or []
+    if raw_posts:
+        upsert_posts(db, creator_id, raw_posts)
+    if cip.get("scores"):
+        insert_creator_scores(
+            db, creator_id, cip["scores"],
+            post_metrics=cip.get("posts", {}),
+            reel_metrics=cip.get("reels", {}),
+            comment_metrics=cip.get("comments", {}),
+            pipeline_version=cip.get("pipeline_version", "1.1"),
+        )
+    if cip.get("caption_intelligence") and not cip["caption_intelligence"].get(
+        "_llm_failure"
+    ):
+        insert_caption_intelligence(db, creator_id, cip["caption_intelligence"])
+    if cip.get("transcript_intelligence") and not cip["transcript_intelligence"].get(
+        "_llm_failure"
+    ):
         insert_transcript_intelligence(
             db, creator_id, cip["transcript_intelligence"]
         )
-
-    # Audience intelligence
-    if cip.get("audience_intelligence"):
-        insert_audience_intelligence(
-            db, creator_id, cip["audience_intelligence"]
-        )
-
-    logger.info(f"Stored full CIP for @{profile.get('handle')} -> {creator_id}")
+    if cip.get("audience_intelligence") and not cip["audience_intelligence"].get(
+        "_llm_failure"
+    ):
+        insert_audience_intelligence(db, creator_id, cip["audience_intelligence"])
     return creator_id
 
 

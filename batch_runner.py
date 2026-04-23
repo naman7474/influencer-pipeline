@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from pipeline.pipeline import build_creator_intelligence_profile, clean_cip_for_export
 from pipeline.db import store_full_cip
+from pipeline.calibration import load_er_benchmarks
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +33,11 @@ def run_batch(
 
     results = []
 
+    # Pre-load percentile-calibrated ER benchmarks once per batch.
+    # Falls back to DEFAULT_ER_BENCHMARKS when no live calibration
+    # exists yet; loader caches internally so parallel workers share.
+    er_benchmarks = load_er_benchmarks(db) if db else None
+
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_url = {
             executor.submit(
@@ -40,6 +46,7 @@ def run_batch(
                 brightdata_token,
                 gemini_key,
                 openai_key,
+                er_benchmarks=er_benchmarks,
             ): url
             for url in profile_urls
         }

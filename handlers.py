@@ -165,6 +165,206 @@ def _enqueue_creator_fanout(
     return len(rows)
 
 
+# ── Phase 2.5 auto-stitch helpers ────────────────────────────────────────
+
+AUTO_STITCH_CONFIDENCE_THRESHOLD = 0.9
+
+
+def _has_platform_profile(db, creator_id: str, platform: str) -> bool:
+    """Has this creator already got a profile on `platform`?
+
+    Used as loop-prevention + idempotency for auto-stitch fanouts.
+    """
+    res = (
+        db.table("creator_social_profiles")
+        .select("id")
+        .eq("creator_id", creator_id)
+        .eq("platform", platform)
+        .limit(1)
+        .execute()
+    )
+    return bool(res.data)
+
+
+def _record_stitch_candidate(
+    db,
+    source_creator_id: str,
+    target_creator_id: str | None,
+    candidate,
+    status: str = "pending",
+) -> None:
+    """Write a row to `stitch_candidates` for admin review.
+
+    Called when auto-fanout would create a cross-creator collision
+    (the target handle already belongs to a different creators.id).
+    The unique index on (source, source_platform, target_platform,
+    target_handle) WHERE status='pending' dedupes re-scrapes.
+    """
+    row = {
+        "source_creator_id": source_creator_id,
+        "target_creator_id": target_creator_id,
+        "source_platform": candidate.source_platform,
+        "target_platform": candidate.target_platform,
+        "target_handle": candidate.target_handle,
+        "confidence": float(candidate.confidence),
+        "reason": candidate.reason,
+        "status": status,
+    }
+    try:
+        db.table("stitch_candidates").insert(row).execute()
+    except Exception as e:  # noqa: BLE001
+        # Unique index on open candidates — silently ignore dup inserts
+        logger.debug(f"stitch_candidate insert skipped: {e}")
+
+
+def _enqueue_auto_stitch_ig_scrape(
+    db, target_handle: str, existing_creator_id: str, confidence: float
+) -> None:
+    """Enqueue a `creator_ig_scrape` bound to an existing creators.id.
+
+    Same job_type as the brand-fanout path — the only difference is the
+    `existing_creator_id` payload key which `store_full_cip` honors to
+    attach the IG profile onto an existing row rather than creating a
+    new one.
+    """
+    row = {
+        "job_type": "creator_ig_scrape",
+        "status": "queued",
+        "payload": {
+            "handle": target_handle,
+            "existing_creator_id": existing_creator_id,
+            "source": "auto_stitch_from_yt",
+            "source_confidence": float(confidence),
+        },
+        "available_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db.table("background_jobs").insert(row).execute()
+
+
+def _enqueue_auto_stitch_yt_scrape(
+    db, target_url: str, existing_creator_id: str, confidence: float
+) -> None:
+    """Enqueue a `creator_yt_scrape` bound to an existing creators.id."""
+    row = {
+        "job_type": "creator_yt_scrape",
+        "status": "queued",
+        "payload": {
+            "url": target_url,
+            "existing_creator_id": existing_creator_id,
+            "source": "auto_stitch_from_ig",
+            "source_confidence": float(confidence),
+        },
+        "available_at": datetime.now(timezone.utc).isoformat(),
+    }
+    db.table("background_jobs").insert(row).execute()
+
+
+def _run_auto_stitch_from_yt(db, creator_id: str, cip: dict) -> None:
+    """After a YT scrape completes, inspect external_links for IG handles
+    and auto-fan-out IG scrapes bound to the same creator_id.
+
+    Safeguards:
+      - only confidence >= 0.9 (direct URL links, not handle-string matches)
+      - skip if creator already has an IG profile (loop prevention)
+      - skip-and-flag if target handle already belongs to a different creator
+        (cross-creator collision → stitch_candidates)
+    """
+    from pipeline.youtube.stitching import propose_stitch_candidates
+
+    profile = cip.get("profile") or {}
+    candidates = propose_stitch_candidates(
+        source_platform="youtube",
+        source_handle=profile.get("handle") or "",
+        source_external_links=profile.get("external_links"),
+        target_platforms=("instagram",),
+    )
+    auto = [c for c in candidates if c.confidence >= AUTO_STITCH_CONFIDENCE_THRESHOLD]
+    if not auto:
+        return
+
+    for cand in auto:
+        if _has_platform_profile(db, creator_id, "instagram"):
+            logger.debug(
+                f"Auto-stitch skipped: creator {creator_id} already has IG profile"
+            )
+            break  # already IG-present — no need to check further candidates
+        other_id = pdb._find_creator_by_platform_profile(
+            db, "instagram", None, cand.target_handle
+        )
+        if other_id and other_id != creator_id:
+            logger.info(
+                f"Auto-stitch collision: YT creator {creator_id} links to "
+                f"@{cand.target_handle} which belongs to {other_id} — "
+                "recording stitch_candidate for admin review"
+            )
+            _record_stitch_candidate(db, creator_id, other_id, cand)
+            continue
+        logger.info(
+            f"Auto-stitch fanout: YT creator {creator_id} -> IG @{cand.target_handle}"
+        )
+        _enqueue_auto_stitch_ig_scrape(
+            db, cand.target_handle, creator_id, cand.confidence
+        )
+
+
+def _run_auto_stitch_from_ig(db, creator_id: str, cip: dict) -> None:
+    """After an IG scrape completes, inspect `profile.external_url` for a
+    YouTube link and auto-fan-out a YT scrape bound to the same creator_id.
+
+    IG has a single-valued `external_url` field (not a list like YT's about
+    panel), so we check it directly. Same safeguards as the YT->IG flow.
+    """
+    from pipeline.youtube.stitching import (
+        StitchCandidate,
+        extract_handles_from_links,
+    )
+
+    profile = cip.get("profile") or {}
+    external_url = profile.get("external_url")
+    if not external_url:
+        return
+
+    linked = extract_handles_from_links(
+        [{"label": "external", "url": external_url}]
+    )
+    yt_handles = linked.get("youtube") or set()
+    if not yt_handles:
+        return
+
+    source_handle = (profile.get("handle") or "").lstrip("@").lower()
+    for yt_handle in yt_handles:
+        if _has_platform_profile(db, creator_id, "youtube"):
+            logger.debug(
+                f"Auto-stitch skipped: creator {creator_id} already has YT profile"
+            )
+            break
+        target_url = f"https://www.youtube.com/@{yt_handle}"
+        other_id = pdb._find_creator_by_platform_profile(
+            db, "youtube", None, yt_handle
+        )
+        cand = StitchCandidate(
+            source_platform="instagram",
+            source_handle=source_handle,
+            target_platform="youtube",
+            target_handle=yt_handle,
+            confidence=1.0,
+            reason=(
+                f"instagram profile external_url links to youtube.com/@{yt_handle}"
+            ),
+        )
+        if other_id and other_id != creator_id:
+            logger.info(
+                f"Auto-stitch collision: IG creator {creator_id} links to "
+                f"YT @{yt_handle} which belongs to {other_id}"
+            )
+            _record_stitch_candidate(db, creator_id, other_id, cand)
+            continue
+        logger.info(
+            f"Auto-stitch fanout: IG creator {creator_id} -> YT @{yt_handle}"
+        )
+        _enqueue_auto_stitch_yt_scrape(db, target_url, creator_id, cand.confidence)
+
+
 def _brand_handle_from(brand: dict) -> str:
     raw = brand.get("instagram_handle") or ""
     return raw.strip().lstrip("@").strip("/").lower()
@@ -332,6 +532,10 @@ def handle_creator_ig_scrape(db, job: dict) -> None:
     payload = job.get("payload") or {}
     handle = payload.get("handle")
     parent_brand_id = payload.get("parent_brand_id") or job.get("brand_id")
+    # Phase 2.5 auto-stitch: when a YT scrape discovered this creator's
+    # IG handle in external_links, it enqueues this job with the existing
+    # creators.id so the IG profile attaches onto the same row.
+    existing_creator_id = payload.get("existing_creator_id")
     if not handle:
         raise ValueError("creator_ig_scrape job missing handle in payload")
 
@@ -349,12 +553,25 @@ def handle_creator_ig_scrape(db, job: dict) -> None:
     if cip.get("error"):
         raise RuntimeError(f"CIP failed for creator @{handle}: {cip['error']}")
 
-    creator_id = pdb.store_full_cip(db, cip)
+    creator_id = pdb.store_full_cip(db, cip, existing_creator_id=existing_creator_id)
 
     embedding_input = build_creator_embedding_input(cip)
     if embedding_input:
         embedding = embed_text(embedding_input, openai_key)
+        # Shadow column (creators.content_embedding) for one release.
         _update_creator_embedding(db, creator_id, embedding)
+        # Per-platform embedding (migration 046) — canonical going forward.
+        pdb.upsert_creator_platform_embedding(
+            db, creator_id, "instagram", embedding
+        )
+
+    # Auto-stitch: discover YT handle in IG's external_url, fan out a YT
+    # scrape bound to the same creator row. Skips if creator already has
+    # a YT profile (loop prevention for YT->IG->YT round-trip).
+    try:
+        _run_auto_stitch_from_ig(db, creator_id, cip)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"IG auto-stitch failed for creator {creator_id}: {e}")
 
     # If this creator was part of a brand fanout, trigger a brand-scoped
     # recompute when the whole fanout is done. Otherwise (standalone
@@ -570,9 +787,219 @@ def handle_content_video_analysis(db, job: dict) -> None:
 
 # ── Dispatch ────────────────────────────────────────────────────────────────
 
+def handle_creator_yt_scrape(db, job: dict) -> None:
+    """Per-creator YouTube scrape.
+
+    Payload accepts any of: {url} | {channel_id} | {handle}. The first
+    available is resolved into a canonical URL before the build runs.
+    Mirrors handle_creator_ig_scrape's responsibility.
+
+    Phase 2.5: also checks `existing_creator_id` in payload (set by the
+    symmetric IG→YT auto-stitch) so YT can attach onto an existing row.
+    """
+    from pipeline.pipeline import build_youtube_creator_intelligence_profile
+    from pipeline.youtube.handle_resolver import resolve as resolve_yt
+
+    payload = job.get("payload") or {}
+    parent_brand_id = payload.get("parent_brand_id") or job.get("brand_id")
+    existing_creator_id = payload.get("existing_creator_id")
+
+    raw = (
+        payload.get("url")
+        or payload.get("channel_url")
+        or payload.get("channel_id")
+        or payload.get("handle")
+    )
+    if not raw:
+        raise ValueError("creator_yt_scrape job missing url/channel_id/handle")
+
+    resolved = resolve_yt(raw)
+    channel_url = resolved.url
+
+    cip = build_youtube_creator_intelligence_profile(
+        channel_url=channel_url,
+        brightdata_token=_require_env("BRIGHTDATA_API_TOKEN"),
+        gemini_api_key=_require_env("GEMINI_API_KEY"),
+        openai_api_key=_require_env("OPENAI_API_KEY"),
+        youtube_api_key=os.environ.get("YOUTUBE_API_KEY"),
+    )
+    if cip.get("error"):
+        raise RuntimeError(
+            f"YT CIP failed for {channel_url}: {cip['error']}"
+        )
+
+    creator_id = pdb.store_youtube_cip(
+        db, cip, existing_creator_id=existing_creator_id
+    )
+
+    embedding_input = build_creator_embedding_input(cip)
+    if embedding_input:
+        embedding = embed_text(embedding_input, _require_env("OPENAI_API_KEY"))
+        # Per-platform embedding for scoring (migration 046). No shadow
+        # column write for YT — that field is IG-indexed.
+        pdb.upsert_creator_platform_embedding(
+            db, creator_id, "youtube", embedding
+        )
+
+    # Auto-stitch: inspect YT external_links for IG URL, fan out an IG
+    # scrape bound to the same creator row.
+    try:
+        _run_auto_stitch_from_yt(db, creator_id, cip)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"YT auto-stitch failed for creator {creator_id}: {e}")
+
+    if parent_brand_id and _siblings_all_terminal(db, parent_brand_id):
+        _trigger_matching_compute(parent_brand_id)
+    elif not parent_brand_id and creator_id:
+        _trigger_creator_recompute(creator_id)
+
+
+def handle_brand_yt_scrape(db, job: dict) -> None:
+    """Brand-side YouTube analysis: scrape + CIP the brand's own YT channel.
+
+    Parallels handle_brand_ig_scrape. The result lands in
+    brand_platform_analyses(platform='youtube'). Collaborator fanout
+    (triggering per-creator scrapes for tagged-in-video creators) is
+    deferred — YT collabs are surfaced differently from IG tags and
+    deserve their own handler.
+    """
+    from pipeline.pipeline import build_youtube_creator_intelligence_profile
+    from pipeline.youtube.handle_resolver import resolve as resolve_yt
+
+    payload = job.get("payload") or {}
+    brand_id = job.get("brand_id") or payload.get("brand_id")
+    raw = (
+        payload.get("url")
+        or payload.get("channel_url")
+        or payload.get("handle")
+    )
+    if not brand_id or not raw:
+        raise ValueError("brand_yt_scrape job missing brand_id or channel url")
+
+    resolved = resolve_yt(raw)
+    cip = build_youtube_creator_intelligence_profile(
+        channel_url=resolved.url,
+        brightdata_token=_require_env("BRIGHTDATA_API_TOKEN"),
+        gemini_api_key=_require_env("GEMINI_API_KEY"),
+        openai_api_key=_require_env("OPENAI_API_KEY"),
+        youtube_api_key=os.environ.get("YOUTUBE_API_KEY"),
+    )
+
+    # Extract @handle + channel_id mentions across the brand's own videos.
+    # These are the creators the brand has publicly collab'd with and are
+    # the highest-priority fanout targets for per-creator YT scrapes.
+    from pipeline.youtube.collaborators import extract_collaborators
+
+    collab_report = extract_collaborators(
+        cip.get("videos") or [],
+        self_handle=(cip.get("profile") or {}).get("handle"),
+        self_channel_id=(cip.get("resolved") or {}).get("channel_id"),
+    )
+    collaborator_handles = [c["handle"] for c in collab_report["handles"]]
+
+    analysis = {
+        "handle": (cip.get("profile") or {}).get("handle"),
+        "profile_url": resolved.url,
+        "analysis_status": "failed" if cip.get("error") else "completed",
+        "analysis_completed_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_error": cip.get("error"),
+        "content_dna": cip.get("caption_intelligence"),
+        "audience_profile": cip.get("audience_intelligence"),
+        "collaborators": collaborator_handles,
+    }
+    pdb.upsert_brand_platform_analysis(db, brand_id, "youtube", analysis)
+
+
+def handle_creator_multi_platform_scrape(db, job: dict) -> None:
+    """Run IG and YT scrapes concurrently for a single creator.
+
+    Both pipelines are I/O-bound (HTTP polling + Whisper + Gemini + API
+    calls). A `ThreadPoolExecutor` gives us true parallelism without the
+    async refactor. Wall-clock ≈ max(ig_time, yt_time) instead of sum.
+
+    Payload:
+      ig_handle           (optional): IG handle (without leading @)
+      yt_url              (optional): canonical YT channel URL / @handle
+      existing_creator_id (optional): bind both profiles to this row
+      parent_brand_id     (optional): triggers matching compute on both-terminal
+
+    If only one of ig_handle / yt_url is set, we just run that side.
+    Errors on one platform don't abort the other; each raises
+    independently via its thread's fut.result() if both fail.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    payload = job.get("payload") or {}
+    ig_handle = payload.get("ig_handle")
+    yt_url = payload.get("yt_url") or payload.get("channel_url")
+    existing_creator_id = payload.get("existing_creator_id")
+    parent_brand_id = payload.get("parent_brand_id") or job.get("brand_id")
+
+    if not ig_handle and not yt_url:
+        raise ValueError(
+            "creator_multi_platform_scrape job missing ig_handle and yt_url"
+        )
+
+    results: dict[str, str | None] = {"instagram": None, "youtube": None}
+    errors: dict[str, str] = {}
+
+    def _ig() -> str | None:
+        sub_job = {
+            "payload": {
+                "handle": ig_handle,
+                "existing_creator_id": existing_creator_id,
+                "parent_brand_id": parent_brand_id,
+            }
+        }
+        handle_creator_ig_scrape(db, sub_job)
+        return existing_creator_id  # store_full_cip returned id is discarded
+        # by handle_creator_ig_scrape; we could plumb it back but the
+        # multi-platform handler just needs to know it ran.
+
+    def _yt() -> str | None:
+        sub_job = {
+            "payload": {
+                "url": yt_url,
+                "existing_creator_id": existing_creator_id,
+                "parent_brand_id": parent_brand_id,
+            }
+        }
+        handle_creator_yt_scrape(db, sub_job)
+        return existing_creator_id
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures: dict[str, object] = {}
+        if ig_handle:
+            futures["instagram"] = pool.submit(_ig)
+        if yt_url:
+            futures["youtube"] = pool.submit(_yt)
+        for platform, fut in futures.items():
+            try:
+                results[platform] = fut.result()
+            except Exception as e:  # noqa: BLE001
+                errors[platform] = str(e)
+                logger.exception(
+                    f"multi_platform_scrape: {platform} failed"
+                )
+
+    # If one platform failed and the other succeeded, we still surface the
+    # failure so the worker marks the job failed. If both failed, same.
+    if errors and len(errors) == len(results):
+        raise RuntimeError(
+            f"multi_platform_scrape: all platforms failed: {errors}"
+        )
+
+    # Only trigger matching once, after both children finish.
+    if parent_brand_id and _siblings_all_terminal(db, parent_brand_id):
+        _trigger_matching_compute(parent_brand_id)
+
+
 HANDLERS = {
     "brand_ig_scrape": handle_brand_ig_scrape,
     "creator_ig_scrape": handle_creator_ig_scrape,
+    "brand_yt_scrape": handle_brand_yt_scrape,
+    "creator_yt_scrape": handle_creator_yt_scrape,
+    "creator_multi_platform_scrape": handle_creator_multi_platform_scrape,
     "content_video_analysis": handle_content_video_analysis,
 }
 

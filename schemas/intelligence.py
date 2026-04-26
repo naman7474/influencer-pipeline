@@ -325,6 +325,24 @@ class AudienceGeographyInference(_Base):
         default_factory=AudienceGeoSplit
     )
 
+    @field_validator("regions", mode="before")
+    @classmethod
+    def _coerce_regions(cls, v):
+        """Gemini sometimes returns regions as a list of strings, other times
+        as a list of `{region, confidence, signals}` objects (matches the
+        prompt template). Accept both — extract `.region` from objects."""
+        if not v:
+            return []
+        out: list[str] = []
+        for item in v:
+            if isinstance(item, str):
+                out.append(item)
+            elif isinstance(item, dict):
+                name = item.get("region") or item.get("name")
+                if name:
+                    out.append(str(name))
+        return out
+
 
 class AudienceAuthenticity(_Base):
     authenticity_score: Optional[float] = None

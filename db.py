@@ -269,9 +269,17 @@ def _build_data_quality_envelope(
 
 
 def insert_caption_intelligence(
-    db: Client, creator_id: str, intel: dict
+    db: Client,
+    creator_id: str,
+    intel: dict,
+    platform: str = "instagram",
 ) -> None:
-    """Insert Gemini caption analysis results."""
+    """Insert Gemini caption analysis results.
+
+    `platform` was added in migration 047 so a YT rescrape no longer
+    overwrites the creator's IG analysis. Default stays 'instagram' so
+    every existing IG call-site keeps working without argument changes.
+    """
     niche = intel.get("niche_classification", {})
     tone = intel.get("tone_profile", {})
     lang = intel.get("language_analysis", {})
@@ -282,6 +290,7 @@ def insert_caption_intelligence(
 
     row = {
         "creator_id": creator_id,
+        "platform": platform,
         "primary_niche": niche.get("primary_niche"),
         "secondary_niche": niche.get("secondary_niche"),
         "niche_confidence": niche.get("confidence"),
@@ -328,9 +337,15 @@ def insert_caption_intelligence(
 
 
 def insert_transcript_intelligence(
-    db: Client, creator_id: str, intel: dict
+    db: Client,
+    creator_id: str,
+    intel: dict,
+    platform: str = "instagram",
 ) -> None:
-    """Insert Gemini transcript analysis results."""
+    """Insert Gemini transcript analysis results.
+
+    Platform-scoped — see insert_caption_intelligence.
+    """
     speaking = intel.get("speaking_language", {})
     hooks = intel.get("hook_analysis", {})
     depth = intel.get("content_depth", {})
@@ -339,6 +354,7 @@ def insert_transcript_intelligence(
 
     row = {
         "creator_id": creator_id,
+        "platform": platform,
         # Speaking language
         "primary_spoken_language": speaking.get("primary_spoken_language"),
         "languages_spoken": speaking.get("languages_spoken", []),
@@ -392,9 +408,15 @@ def insert_transcript_intelligence(
 
 
 def insert_audience_intelligence(
-    db: Client, creator_id: str, intel: dict
+    db: Client,
+    creator_id: str,
+    intel: dict,
+    platform: str = "instagram",
 ) -> None:
-    """Insert Gemini comment/audience analysis results."""
+    """Insert Gemini comment/audience analysis results.
+
+    Platform-scoped — see insert_caption_intelligence.
+    """
     lang_dist = intel.get("audience_language_distribution", {})
     geo = intel.get("audience_geography_inference", {})
     auth = intel.get("audience_authenticity", {})
@@ -404,6 +426,7 @@ def insert_audience_intelligence(
 
     row = {
         "creator_id": creator_id,
+        "platform": platform,
         "audience_languages": lang_dist.get("languages", {}),
         "primary_audience_language": lang_dist.get(
             "primary_audience_language"
@@ -457,7 +480,11 @@ def insert_audience_intelligence(
     logger.info(f"Upserted audience intelligence for {creator_id}")
 
 
-def store_full_cip(db: Client, cip: dict) -> str:
+def store_full_cip(
+    db: Client,
+    cip: dict,
+    existing_creator_id: str | None = None,
+) -> str:
     """
     Store a complete CIP into the database.
     This is the main entry point — called BEFORE _clean_internal_fields
@@ -468,13 +495,27 @@ def store_full_cip(db: Client, cip: dict) -> str:
     (Supabase Storage) always runs on the Python side because it is
     not transactional with DB state.
 
+    `existing_creator_id` (Phase 2.5 auto-stitch): when set, the caller
+    has an existing canonical `creators.id` we should write onto (e.g.
+    a YT scrape discovered this creator's IG handle in external_links
+    and auto-enqueued an IG scrape bound to the same row). In that
+    case we skip `upsert_creator` (which keys on handle and would
+    create a new row) and instead route writes through
+    `upsert_social_profile` against the existing id. Returns the same
+    `existing_creator_id` the caller passed in.
+
     Returns the creator UUID.
     """
     profile = cip.get("profile", {})
-    if USE_TX_RPC:
+    if USE_TX_RPC and not existing_creator_id:
         return _store_full_cip_via_rpc(db, cip)
 
-    creator_id = upsert_creator(db, profile)
+    if existing_creator_id:
+        creator_id = existing_creator_id
+        # Write the IG profile onto the existing canonical creators row.
+        upsert_social_profile(db, creator_id, "instagram", profile)
+    else:
+        creator_id = upsert_creator(db, profile)
 
     # Store raw posts
     raw_posts = cip.get("_raw_posts", [])
@@ -810,3 +851,361 @@ def _to_int(val):
         return int(val)
     except (ValueError, TypeError):
         return None
+
+
+# ── Multi-platform helpers (migration 043/044) ─────────────
+# These back the YouTube path and, going forward, replace direct
+# writes to creators.{handle, followers, instagram_id, ...}. The IG
+# pipeline still writes those columns for one release as a shadow.
+
+
+def upsert_social_profile(
+    db: Client,
+    creator_id: str,
+    platform: str,
+    profile: dict,
+) -> str:
+    """Upsert one row into creator_social_profiles.
+
+    `profile` is the normalized dict emitted by
+    youtube.scraper_channels.extract_channel_metrics or the IG-side
+    extract_profile_metrics (wrapped with a platform key).
+    """
+    row = {
+        "creator_id": creator_id,
+        "platform": platform,
+        "handle": profile["handle"],
+        "platform_user_id": profile.get("platform_user_id")
+        or profile.get("instagram_id"),
+        "profile_url": profile.get("profile_url"),
+        "display_name": profile.get("display_name"),
+        "bio": profile.get("bio") or profile.get("biography"),
+        "avatar_url": profile.get("avatar_url"),
+        "category": profile.get("category"),
+        "country": profile.get("country"),
+        "is_verified": profile.get("is_verified", False),
+        "is_business": profile.get("is_business", False),
+        "followers_or_subs": profile.get("followers_or_subs")
+        or profile.get("followers")
+        or 0,
+        "posts_or_videos_count": profile.get("posts_or_videos_count")
+        or profile.get("posts_count")
+        or 0,
+        "avg_engagement": profile.get("avg_engagement")
+        or profile.get("brightdata_avg_engagement"),
+        "external_links": profile.get("external_links") or [],
+        "last_synced_at": datetime.now().isoformat(),
+    }
+
+    result = (
+        db.table("creator_social_profiles")
+        .upsert(row, on_conflict="creator_id,platform")
+        .execute()
+    )
+    csp_id = result.data[0]["id"]
+    logger.info(
+        f"Upserted {platform} social profile for creator {creator_id} -> {csp_id}"
+    )
+    return csp_id
+
+
+def upsert_youtube_videos(
+    db: Client, creator_id: str, videos: list[dict]
+) -> list[str]:
+    """Insert YouTube videos for a creator. Returns list of row UUIDs."""
+    if not videos:
+        return []
+
+    rows = []
+    for v in videos:
+        video_id = v.get("video_id")
+        if not video_id:
+            continue
+        rows.append(
+            {
+                "creator_id": creator_id,
+                "video_id": video_id,
+                "url": v.get("url"),
+                "title": v.get("title"),
+                "description": v.get("description"),
+                "tags": v.get("tags") or [],
+                "category_id": v.get("category_id"),
+                "is_short": bool(v.get("is_short", False)),
+                "is_livestream": bool(v.get("is_livestream", False)),
+                "duration_seconds": v.get("duration_seconds"),
+                "view_count": v.get("view_count") or 0,
+                "like_count": v.get("like_count") or 0,
+                "comment_count": v.get("comment_count") or 0,
+                "thumbnail_url": v.get("thumbnail_url"),
+                "has_captions": bool(v.get("has_captions", False)),
+                "caption_source": v.get("caption_source"),
+                "published_at": v.get("published_at"),
+            }
+        )
+
+    if not rows:
+        return []
+
+    result = (
+        db.table("youtube_videos")
+        .upsert(rows, on_conflict="creator_id,video_id")
+        .execute()
+    )
+    ids = [r["id"] for r in (result.data or [])]
+    logger.info(f"Upserted {len(ids)} YouTube videos for creator {creator_id}")
+    return ids
+
+
+def upsert_creator_score_platform(
+    db: Client, creator_id: str, platform: str, scores: dict
+) -> None:
+    """Write a per-platform creator_scores row.
+
+    Separate from upsert_creator_scores (IG path) so the platform column
+    is explicit. For IG, callers can keep using upsert_creator_scores and
+    it will default platform='instagram' at the DB level.
+    """
+    row = {
+        **scores,
+        "creator_id": creator_id,
+        "platform": platform,
+        "computed_at": datetime.now().isoformat(),
+    }
+    db.table("creator_scores").insert(row).execute()
+    logger.info(f"Wrote {platform} creator_scores row for {creator_id}")
+
+
+def upsert_creator_platform_embedding(
+    db: Client, creator_id: str, platform: str, embedding: list[float]
+) -> None:
+    """Write a per-platform content embedding (migration 046).
+
+    Replaces the single-valued `creators.content_embedding` for scoring
+    purposes. A YT rescrape no longer overwrites IG's DNA vector.
+    Existing `creators.content_embedding` is kept as a shadow for one
+    release — IG callers should populate both this table AND the shadow
+    column until the shadow is dropped in the follow-up migration.
+    """
+    if not embedding:
+        return
+    db.table("creator_content_embeddings").upsert(
+        {
+            "creator_id": creator_id,
+            "platform": platform,
+            "embedding": embedding,
+            "computed_at": datetime.now().isoformat(),
+        },
+        on_conflict="creator_id,platform",
+    ).execute()
+    logger.debug(
+        f"Upserted {platform} content embedding for creator {creator_id}"
+    )
+
+
+def upsert_brand_platform_analysis(
+    db: Client, brand_id: str, platform: str, analysis: dict
+) -> None:
+    """Upsert into brand_platform_analyses (generalizes brands.ig_*)."""
+    row = {
+        "brand_id": brand_id,
+        "platform": platform,
+        "handle": analysis.get("handle"),
+        "profile_url": analysis.get("profile_url"),
+        "analysis_status": analysis.get("analysis_status", "none"),
+        "analysis_completed_at": analysis.get("analysis_completed_at"),
+        "analysis_error": analysis.get("analysis_error"),
+        "content_dna": analysis.get("content_dna"),
+        "audience_profile": analysis.get("audience_profile"),
+        "collaborators": analysis.get("collaborators") or [],
+        "content_embedding": analysis.get("content_embedding"),
+        "embedding_computed_at": analysis.get("embedding_computed_at"),
+    }
+    db.table("brand_platform_analyses").upsert(
+        row, on_conflict="brand_id,platform"
+    ).execute()
+    logger.info(f"Upserted {platform} brand analysis for brand {brand_id}")
+
+
+def _find_creator_by_platform_profile(
+    db: Client, platform: str, platform_user_id: str | None, handle: str | None
+) -> str | None:
+    """Look up an existing creator via creator_social_profiles.
+
+    Prefers platform_user_id (stable) over handle (can change). Returns
+    creator_id or None. Used by the YT ingestion path so a single creator
+    with both IG and YT profiles ends up on one row rather than two.
+    """
+    if platform_user_id:
+        res = (
+            db.table("creator_social_profiles")
+            .select("creator_id")
+            .eq("platform", platform)
+            .eq("platform_user_id", platform_user_id)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["creator_id"]
+    if handle:
+        res = (
+            db.table("creator_social_profiles")
+            .select("creator_id")
+            .eq("platform", platform)
+            .eq("handle", handle)
+            .limit(1)
+            .execute()
+        )
+        if res.data:
+            return res.data[0]["creator_id"]
+    return None
+
+
+def _create_youtube_creator_shell(db: Client, profile: dict) -> str:
+    """Create a minimal `creators` row for a YouTube-first creator.
+
+    The legacy `creators` table requires `handle`. For YT-primary creators
+    we use the YT handle (strip leading @). A follow-up migration will let
+    `creators.handle` go nullable — until then this keeps the NOT NULL
+    constraint satisfied without colliding with IG handles (YT handles
+    can legally collide with IG; we suffix `_yt` on collision).
+    """
+    handle_base = profile.get("handle") or profile.get("platform_user_id") or ""
+    handle = handle_base
+    # Disambiguate against an existing IG handle with the same string.
+    existing = (
+        db.table("creators").select("id").eq("handle", handle).limit(1).execute()
+    )
+    if existing.data:
+        handle = f"{handle_base}_yt"
+
+    row = {
+        "handle": handle,
+        "display_name": profile.get("display_name"),
+        "biography": profile.get("bio"),
+        "avatar_url": profile.get("avatar_url"),
+        "category": profile.get("category"),
+        "country": profile.get("country"),
+        "is_verified": profile.get("is_verified", False),
+        "followers": profile.get("followers_or_subs") or 0,
+        "posts_count": profile.get("posts_or_videos_count") or 0,
+        "tier": profile.get("tier", "nano"),
+        # YT scraper extracts contact info from bio (no dedicated field
+        # on YouTube). Persist on the canonical creators row so the
+        # outreach flow finds it the same way it finds IG-side emails.
+        "contact_email": profile.get("email"),
+        "contact_phone": profile.get("phone"),
+        "last_scraped_at": datetime.now().isoformat(),
+    }
+    result = db.table("creators").insert(row).execute()
+    return result.data[0]["id"]
+
+
+def store_youtube_cip(
+    db: Client,
+    cip: dict,
+    existing_creator_id: str | None = None,
+) -> str:
+    """Persist a YouTube CIP (output of build_youtube_creator_intelligence_profile).
+
+    Mirrors store_full_cip's responsibility but writes onto the
+    platform-aware tables:
+      - creator_social_profiles(platform='youtube')
+      - youtube_videos
+      - creator_scores(platform='youtube')
+      - caption_intelligence / transcript_intelligence / audience_intelligence
+
+    Phase 2.5 auto-stitch: when `existing_creator_id` is set, we skip the
+    find-or-create step and attach the YT profile onto the caller-provided
+    `creators.id` (e.g., IG scrape discovered the creator's YT handle in
+    its external_url and fanned out a YT scrape bound to the same row).
+
+    Returns the creator UUID.
+    """
+    profile = cip.get("profile") or {}
+    resolved = cip.get("resolved") or {}
+
+    # 1. Find or create the canonical `creators` row.
+    if existing_creator_id:
+        creator_id = existing_creator_id
+    else:
+        creator_id = _find_creator_by_platform_profile(
+            db,
+            platform="youtube",
+            platform_user_id=resolved.get("channel_id")
+            or profile.get("platform_user_id"),
+            handle=profile.get("handle"),
+        )
+        if not creator_id:
+            creator_id = _create_youtube_creator_shell(db, profile)
+
+    # 1b. Backfill contact info on the canonical creators row when the
+    # existing row has NULL for contact_email / contact_phone but our YT
+    # scrape found one in the bio. Don't overwrite an existing IG-side
+    # value — that one was explicit; ours is bio-extracted.
+    yt_email = profile.get("email")
+    yt_phone = profile.get("phone")
+    if yt_email or yt_phone:
+        try:
+            current = (
+                db.table("creators")
+                .select("contact_email,contact_phone")
+                .eq("id", creator_id)
+                .single()
+                .execute()
+            )
+            updates: dict = {}
+            if yt_email and not (current.data or {}).get("contact_email"):
+                updates["contact_email"] = yt_email
+            if yt_phone and not (current.data or {}).get("contact_phone"):
+                updates["contact_phone"] = yt_phone
+            if updates:
+                db.table("creators").update(updates).eq("id", creator_id).execute()
+                logger.info(
+                    f"Backfilled contact info on creator {creator_id}: "
+                    f"{list(updates.keys())}"
+                )
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"contact backfill skipped for {creator_id}: {e}")
+
+    # 2. Write / refresh the YT social profile row.
+    upsert_social_profile(db, creator_id, "youtube", profile)
+
+    # 3. Videos.
+    upsert_youtube_videos(db, creator_id, cip.get("videos") or [])
+
+    # 4. Scores — route YT-specific sub-metrics onto their columns.
+    scores = cip.get("scores") or {}
+    if scores:
+        score_row = {
+            "cpi": scores.get("cpi", 0),
+            "engagement_quality": scores.get("engagement_quality", 0),
+            "content_quality": scores.get("content_quality", 0),
+            "audience_authenticity": scores.get("audience_authenticity", 0),
+            "growth_trajectory": scores.get("growth_trajectory", 0),
+            "professionalism": scores.get("professionalism", 0),
+            "avg_views_per_sub": scores.get("avg_views_per_sub"),
+            "watch_through_proxy": scores.get("watch_through_proxy"),
+            "upload_cadence_days": scores.get("upload_cadence_days"),
+            "pipeline_version": cip.get("pipeline_version", "1.1"),
+            "confidence": scores.get("confidence"),
+            "scoring_inputs": scores.get("scoring_inputs", {}),
+        }
+        upsert_creator_score_platform(db, creator_id, "youtube", score_row)
+
+    # 5. Intelligence blocks — platform='youtube' so they don't overwrite
+    # any IG analysis this creator already has (migration 047).
+    cap = cip.get("caption_intelligence")
+    if cap and not (isinstance(cap, dict) and cap.get("_llm_failure")):
+        insert_caption_intelligence(db, creator_id, cap, platform="youtube")
+    tr = cip.get("transcript_intelligence")
+    if tr and not (isinstance(tr, dict) and tr.get("_llm_failure")):
+        insert_transcript_intelligence(db, creator_id, tr, platform="youtube")
+    ai = cip.get("audience_intelligence")
+    if ai and not (isinstance(ai, dict) and ai.get("_llm_failure")):
+        insert_audience_intelligence(db, creator_id, ai, platform="youtube")
+
+    logger.info(
+        f"Stored YouTube CIP for creator {creator_id} "
+        f"(channel_id={resolved.get('channel_id')})"
+    )
+    return creator_id

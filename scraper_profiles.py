@@ -1,4 +1,8 @@
 from pipeline.brightdata_client import BrightdataClient
+from pipeline.contact_extract import (
+    extract_email_from_text,
+    extract_phone_from_text,
+)
 
 DATASET_PROFILES = "gd_l1vikfch901nx3by4"
 
@@ -42,6 +46,17 @@ def extract_profile_metrics(raw_profile: dict) -> dict:
     if followers < LOW_FOLLOWER_CUTOFF:
         data_quality_flags.append("low_followers")
 
+    # Email/phone often live in the bio rather than the dedicated
+    # contact_email / contact_phone_number fields. The dedicated fields
+    # require the creator to opt in via Business Account settings, so
+    # they're frequently empty. Fall back to bio text.
+    bio = raw_profile.get("biography") or ""
+    email = raw_profile.get("contact_email") or extract_email_from_text(bio)
+    phone = (
+        raw_profile.get("contact_phone_number")
+        or extract_phone_from_text(bio)
+    )
+
     return {
         # --- Identity ---
         "handle": raw_profile.get("account"),
@@ -72,9 +87,9 @@ def extract_profile_metrics(raw_profile: dict) -> dict:
         # --- Raw hashtags for niche classification ---
         "bio_hashtags": raw_profile.get("bio_hashtags", []),
         "post_hashtags": raw_profile.get("post_hashtags", []),
-        # --- Contact Info ---
-        "email": raw_profile.get("contact_email"),
-        "phone": raw_profile.get("contact_phone_number"),
+        # --- Contact Info (with bio-fallback when dedicated fields empty) ---
+        "email": email,
+        "phone": phone,
         # --- Data quality signalling ---
         "data_quality_flags": data_quality_flags,
     }

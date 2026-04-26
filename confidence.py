@@ -76,6 +76,34 @@ TIER_HIGH_MIN = 0.80
 TIER_MEDIUM_MIN = 0.50
 
 
+# ── Platform-specific ER benchmarks ─────────────────────────
+# IG benchmark = (likes + comments) / followers; YT benchmark =
+# (likes + comments) / views. The denominators differ, so the
+# tier cutoffs differ too — YT ratios run ~2–3x higher because
+# views < followers for any given piece of content.
+
+IG_ER_BENCHMARKS: dict[str, float] = {
+    "nano": 0.06,
+    "micro": 0.04,
+    "mid": 0.025,
+    "macro": 0.015,
+    "mega": 0.01,
+}
+
+YT_ER_BENCHMARKS: dict[str, float] = {
+    "nano": 0.10,
+    "micro": 0.07,
+    "mid": 0.05,
+    "macro": 0.03,
+    "mega": 0.02,
+}
+
+# Views-per-sub is YT's watch-time proxy — how actively is the sub
+# base actually watching? <0.1 = weak channel, >=0.5 = strong.
+YT_VIEWS_PER_SUB_STRONG = 0.5
+YT_VIEWS_PER_SUB_WEAK = 0.1
+
+
 class CoverageTracker:
     """Records which scoring inputs were real vs. defaulted."""
 

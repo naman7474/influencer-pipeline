@@ -843,6 +843,7 @@ def build_youtube_creator_intelligence_profile(
                 video_url=vurl,
                 bd_client=bd_client,
                 openai_key=openai_api_key,
+                duration_seconds=v.get("duration_seconds"),
             )
             if tr is None:
                 continue
@@ -1141,6 +1142,22 @@ def _build_yt_cip_with_preloaded_channel(
                 profile["topic_categories"] = (
                     stats.get("topic_categories") or []
                 )
+                # Backfill handle from the API-returned `customUrl` (e.g.
+                # "@mkbhd"). Channel-id-form input URLs short-circuit the
+                # handle resolver, so without this the profile.handle stays
+                # null and the JSON output collides on `None.json`.
+                if not profile.get("handle"):
+                    custom_url = (stats.get("custom_url") or "").lstrip("@")
+                    if custom_url:
+                        profile["handle"] = custom_url
+                if not profile.get("display_name") and stats.get("title"):
+                    profile["display_name"] = stats["title"]
+                if not profile.get("bio") and stats.get("description"):
+                    profile["bio"] = stats["description"]
+                if not profile.get("country") and stats.get("country"):
+                    profile["country"] = stats["country"]
+                if not profile.get("channel_created_at") and stats.get("published_at"):
+                    profile["channel_created_at"] = stats["published_at"]
         cip["profile"] = profile
 
         # Videos
@@ -1171,13 +1188,18 @@ def _build_yt_cip_with_preloaded_channel(
             if not vid or not vurl:
                 continue
             tr = fetch_transcript(
-                video_id=vid, video_url=vurl,
-                bd_client=bd_client, openai_key=openai_api_key,
+                video_id=vid,
+                video_url=vurl,
+                bd_client=bd_client,
+                openai_key=openai_api_key,
+                duration_seconds=v.get("duration_seconds"),
             )
             if tr is None:
                 continue
             transcripts.append({
                 "video_id": tr["video_id"],
+                # `post_id` alias so analyze_transcripts (IG-shaped) works.
+                "post_id": tr["video_id"],
                 "transcript_text": tr["text"],
                 "caption_source": tr["source"],
             })

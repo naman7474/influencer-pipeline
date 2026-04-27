@@ -120,10 +120,12 @@ def analyze_transcripts(
     for t in transcripts:
         if not t.get("transcript_text"):
             continue
+        # IG path keys transcripts on `post_id`; YT path on `video_id`. Accept either.
+        item_id = t.get("post_id") or t.get("video_id") or "?"
         is_music = t.get("is_likely_music", False)
         label = " [MUSIC-ONLY — do not use for language/content analysis]" if is_music else ""
         transcripts_block += f"""
---- Reel {t['post_id']}{label} (length: {t.get('reel_length_seconds', '?')}s, detected language: {t.get('detected_language', '?')}, confidence: {t.get('avg_confidence', '?')}) ---
+--- Reel {item_id}{label} (length: {t.get('reel_length_seconds', '?')}s, detected language: {t.get('detected_language', '?')}, confidence: {t.get('avg_confidence', '?')}) ---
 Hook (first 3s): {t.get('hook_text', 'N/A')}
 Full transcript: {t['transcript_text'][:1000]}
 Caption for context: {t.get('caption', '')[:200]}

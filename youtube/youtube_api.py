@@ -21,7 +21,12 @@ Quota accounting (10,000 units/day default):
 
 from __future__ import annotations
 
+import logging
 import os
+import socket
+import ssl
+import threading
+import time
 from typing import Iterable, Optional
 
 try:
@@ -31,26 +36,94 @@ except ImportError:  # google-api-python-client not installed
     build = None
     HttpError = Exception
 
+logger = logging.getLogger(__name__)
+
+
+def _execute_with_retry(req, max_attempts: int = 4, base_backoff: float = 1.0):
+    """Execute a googleapiclient request with retry on transient network errors.
+
+    googleapiclient's built-in retry covers httplib2 errors but not raw
+    ``ssl.SSLError`` ("record layer failure" etc.) which surface from
+    Python's ``http.client`` underneath. We retry SSL/socket/connection
+    errors and 5xx HTTP responses with exponential backoff. 4xx (auth,
+    quota, not-found) is non-retryable and propagates immediately.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_attempts):
+        try:
+            return req.execute()
+        except HttpError as e:
+            status = getattr(getattr(e, "resp", None), "status", 0)
+            try:
+                status = int(status)
+            except (TypeError, ValueError):
+                status = 0
+            if 500 <= status < 600 and attempt + 1 < max_attempts:
+                last_exc = e
+                logger.warning(
+                    "YT API HTTP %s on attempt %d/%d, retrying",
+                    status,
+                    attempt + 1,
+                    max_attempts,
+                )
+                time.sleep(base_backoff * (2**attempt))
+                continue
+            raise
+        except (ssl.SSLError, socket.timeout, ConnectionError, OSError) as e:
+            last_exc = e
+            if attempt + 1 >= max_attempts:
+                raise
+            logger.warning(
+                "YT API transient %s on attempt %d/%d, retrying",
+                type(e).__name__,
+                attempt + 1,
+                max_attempts,
+            )
+            time.sleep(base_backoff * (2**attempt))
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("YT API retry loop ended unexpectedly")
+
 
 class YouTubeAPIClient:
     """Thin wrapper over the Data API v3.
 
     All methods short-circuit if the library isn't installed so the module
     imports cleanly in environments where YouTube support is disabled.
+
+    **Thread safety**: googleapiclient's `build()` returns a service that
+    holds a single `httplib2.Http` connection-pool, which is *not*
+    thread-safe — concurrent `.execute()` calls corrupt the underlying
+    TLS socket and raise ``ssl.SSLError("record layer failure")``. To let
+    callers share one ``YouTubeAPIClient`` across a ThreadPoolExecutor we
+    build a lazy, thread-local service so each worker gets its own pool.
     """
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or os.environ.get("YOUTUBE_API_KEY")
-        if build is None or not self.api_key:
-            self._service = None
-        else:
-            self._service = build(
-                "youtube", "v3", developerKey=self.api_key, cache_discovery=False
-            )
+        # `available` is decided once at construction — depends only on
+        # the library being importable and an api key being set.
+        self.available = bool(build is not None and self.api_key)
+        # Per-thread service cache. Each worker thread builds its own
+        # service the first time it touches the API.
+        self._tls = threading.local()
 
     @property
-    def available(self) -> bool:
-        return self._service is not None
+    def _service(self):
+        if not self.available:
+            return None
+        svc = getattr(self._tls, "service", None)
+        if svc is not None:
+            return svc
+        svc = build(
+            "youtube",
+            "v3",
+            developerKey=self.api_key,
+            cache_discovery=False,
+            static_discovery=True,
+        )
+        self._tls.service = svc
+        return svc
 
     # ── Channel lookups ─────────────────────────────────────────
 
@@ -63,12 +136,11 @@ class YouTubeAPIClient:
         if not self.available or not handle:
             return None
         normalized = handle.lstrip("@")
+        req = self._service.channels().list(
+            part="id", forHandle=normalized, maxResults=1
+        )
         try:
-            resp = (
-                self._service.channels()
-                .list(part="id", forHandle=normalized, maxResults=1)
-                .execute()
-            )
+            resp = _execute_with_retry(req)
         except HttpError:
             return None
         items = resp.get("items") or []
@@ -91,15 +163,12 @@ class YouTubeAPIClient:
         for batch_start in range(0, len(ids), 50):
             batch = ids[batch_start : batch_start + 50]
             try:
-                resp = (
-                    self._service.channels()
-                    .list(
-                        part="snippet,statistics,topicDetails,brandingSettings",
-                        id=",".join(batch),
-                        maxResults=50,
-                    )
-                    .execute()
+                req = self._service.channels().list(
+                    part="snippet,statistics,topicDetails,brandingSettings",
+                    id=",".join(batch),
+                    maxResults=50,
                 )
+                resp = _execute_with_retry(req)
             except HttpError:
                 continue
             for item in resp.get("items") or []:
@@ -145,15 +214,12 @@ class YouTubeAPIClient:
         for batch_start in range(0, len(ids), 50):
             batch = ids[batch_start : batch_start + 50]
             try:
-                resp = (
-                    self._service.videos()
-                    .list(
-                        part="snippet,statistics,contentDetails,topicDetails",
-                        id=",".join(batch),
-                        maxResults=50,
-                    )
-                    .execute()
+                req = self._service.videos().list(
+                    part="snippet,statistics,contentDetails,topicDetails",
+                    id=",".join(batch),
+                    maxResults=50,
                 )
+                resp = _execute_with_retry(req)
             except HttpError:
                 continue
             for item in resp.get("items") or []:
@@ -194,12 +260,11 @@ class YouTubeAPIClient:
         """
         if not self.available or not channel_id:
             return None
+        req = self._service.channels().list(
+            part="contentDetails", id=channel_id, maxResults=1
+        )
         try:
-            resp = (
-                self._service.channels()
-                .list(part="contentDetails", id=channel_id, maxResults=1)
-                .execute()
-            )
+            resp = _execute_with_retry(req)
         except HttpError:
             return None
         items = resp.get("items") or []
@@ -241,11 +306,8 @@ class YouTubeAPIClient:
                 }
                 if page_token:
                     req_kwargs["pageToken"] = page_token
-                resp = (
-                    self._service.playlistItems()
-                    .list(**req_kwargs)
-                    .execute()
-                )
+                req = self._service.playlistItems().list(**req_kwargs)
+                resp = _execute_with_retry(req)
             except HttpError:
                 break
             for item in resp.get("items") or []:
@@ -290,18 +352,15 @@ class YouTubeAPIClient:
         if not self.available or not video_id:
             return []
 
+        req = self._service.commentThreads().list(
+            part="snippet,replies",
+            videoId=video_id,
+            order=order,
+            maxResults=min(100, max_results),
+            textFormat="plainText",
+        )
         try:
-            resp = (
-                self._service.commentThreads()
-                .list(
-                    part="snippet,replies",
-                    videoId=video_id,
-                    order=order,
-                    maxResults=min(100, max_results),
-                    textFormat="plainText",
-                )
-                .execute()
-            )
+            resp = _execute_with_retry(req)
         except HttpError:
             return []
 

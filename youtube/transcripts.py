@@ -34,20 +34,33 @@ from pipeline.brightdata_client import BrightdataClient
 logger = logging.getLogger(__name__)
 
 
+# Long-video handling thresholds.
+# Videos longer than LONG_VIDEO_THRESHOLD_S get sliced into three windows
+# (first / middle / last) to stay under Whisper's 25 MB hard cap and give
+# the LLM a representative cross-section instead of cutting off at minute 25.
+LONG_VIDEO_THRESHOLD_S = 300  # 5 min — under this, download in full
+SAMPLE_WINDOW_S = 150         # 2.5 min per slice (×3 = 7.5 min audio total)
+YT_DLP_TIMEOUT_S = 90         # was 180; bursty hangs cost more than retries
+
+
 def fetch_transcript(
     video_id: str,
     video_url: str,
     bd_client: Optional[BrightdataClient] = None,  # noqa: ARG001 — kept for back-compat
     openai_key: Optional[str] = None,
+    duration_seconds: Optional[int] = None,
 ) -> Optional[dict]:
     """Tiered transcript fetcher.
 
     Returns {video_id, text, source, segments?} on success, None on full
-    miss. `source` is one of: 'youtube_transcript_api', 'whisper'.
-    Callers use `source` for cost telemetry.
+    miss. `source` is one of: 'youtube_transcript_api', 'whisper',
+    'whisper_sampled'. Callers use `source` for cost telemetry.
 
     `bd_client` is accepted but unused — Bright Data has no captions
     dataset. Argument retained so existing call sites don't break.
+
+    `duration_seconds` is optional but recommended — when set, long videos
+    fall into the 3-segment sampler instead of attempting a full download.
     """
     if not video_id:
         return None
@@ -59,7 +72,9 @@ def fetch_transcript(
 
     # ── Tier 2: Whisper on yt-dlp audio (~$0.01) ─────────────────
     if openai_key and video_url:
-        t2 = _try_whisper(video_id, video_url, openai_key)
+        t2 = _try_whisper(
+            video_id, video_url, openai_key, duration_seconds=duration_seconds
+        )
         if t2 is not None:
             return t2
 
@@ -134,14 +149,24 @@ def _try_transcript_api(video_id: str) -> Optional[dict]:
 
 
 def _try_whisper(
-    video_id: str, video_url: str, openai_key: str
+    video_id: str,
+    video_url: str,
+    openai_key: str,
+    duration_seconds: Optional[int] = None,
 ) -> Optional[dict]:
     """Tier 3 — yt-dlp audio download + OpenAI Whisper.
 
-    Creates a tmp audio file (m4a/mp3), transcribes, deletes. Whisper has
-    a 25MB file size limit; we let yt-dlp pick the smallest audio stream.
+    For videos over `LONG_VIDEO_THRESHOLD_S`, downloads three sampled
+    segments (first / middle / last `SAMPLE_WINDOW_S` seconds each) so we
+    stay under Whisper's 25 MB cap without losing a fair representation
+    of the video. Short videos go through the full-download path.
     """
-    audio_path = _download_audio_yt_dlp(video_url)
+    is_sampled = bool(
+        duration_seconds and duration_seconds > LONG_VIDEO_THRESHOLD_S
+    )
+    audio_path = _download_audio_yt_dlp(
+        video_url, duration_seconds=duration_seconds
+    )
     if not audio_path:
         return None
     try:
@@ -157,16 +182,20 @@ def _try_whisper(
 
     return {
         "video_id": video_id,
-        "source": "whisper",
+        "source": "whisper_sampled" if is_sampled else "whisper",
         "text": text,
     }
 
 
-def _download_audio_yt_dlp(video_url: str) -> Optional[str]:
+def _download_audio_yt_dlp(
+    video_url: str, duration_seconds: Optional[int] = None
+) -> Optional[str]:
     """Invoke yt-dlp via subprocess; returns filepath or None on failure.
 
-    yt-dlp is a tool, not a library for our purposes — calling the CLI
-    avoids pinning its Python API (which ships breaking changes often).
+    For long videos (> ``LONG_VIDEO_THRESHOLD_S``), passes three
+    ``--download-sections`` flags so yt-dlp splices a single audio file
+    containing the first / middle / last ``SAMPLE_WINDOW_S`` seconds of
+    the source. Short videos download in full.
     """
     try:
         import yt_dlp  # noqa: F401 — just to confirm installed
@@ -189,10 +218,31 @@ def _download_audio_yt_dlp(video_url: str) -> Optional[str]:
         "--quiet",
         "-o",
         out_template,
-        video_url,
     ]
+
+    if duration_seconds and duration_seconds > LONG_VIDEO_THRESHOLD_S:
+        d = int(duration_seconds)
+        w = SAMPLE_WINDOW_S
+        # First w sec, w sec centred on the midpoint, last w sec.
+        first = (0, w)
+        mid_start = max(d // 2 - w // 2, w)
+        middle = (mid_start, mid_start + w)
+        last = (max(d - w, w), d)
+        for start, end in (first, middle, last):
+            cmd += ["--download-sections", f"*{start}-{end}"]
+        logger.info(
+            "yt-dlp sampling 3×%ss segments (video duration %ss): %s",
+            w,
+            d,
+            ", ".join(f"{s}-{e}" for s, e in (first, middle, last)),
+        )
+
+    cmd.append(video_url)
+
     try:
-        subprocess.run(cmd, check=True, timeout=180, capture_output=True)
+        subprocess.run(
+            cmd, check=True, timeout=YT_DLP_TIMEOUT_S, capture_output=True
+        )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError) as e:
         logger.warning(f"yt-dlp audio download failed for {video_url}: {e}")
         return None

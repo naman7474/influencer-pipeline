@@ -217,12 +217,16 @@ def insert_creator_scores(
         ),
     }
 
-    db.table("creator_scores").upsert(
-        row,
-        on_conflict="creator_id,pipeline_version,computed_at_date",
-    ).execute()
+    # Append-only insert — matches the YT path's `upsert_creator_score_platform`.
+    # Readers (matching engine, mv_creator_leaderboard) pick the latest row per
+    # (creator_id, platform) by `order by computed_at desc`. Re-running the
+    # pipeline for the same creator on the same UTC day produces an additional
+    # row, not an update — but readers never see the older one, and downstream
+    # storage is bounded by the periodic cleanup job. Avoids the migration-035
+    # unique-index dependency that requires a dedupe pass to apply on busy DBs.
+    db.table("creator_scores").insert(row).execute()
     logger.info(
-        f"Upserted scores for {creator_id} — CPI: {scores.get('cpi')} "
+        f"Inserted scores for {creator_id} — CPI: {scores.get('cpi')} "
         f"(tier={scores.get('confidence_tier')}, "
         f"coverage={scores.get('coverage_percentage')}%)"
     )
@@ -331,7 +335,7 @@ def insert_caption_intelligence(
 
     db.table("caption_intelligence").upsert(
         row,
-        on_conflict="creator_id,analyzed_at_date",
+        on_conflict="creator_id,platform",
     ).execute()
     logger.info(f"Upserted caption intelligence for {creator_id}")
 
@@ -402,7 +406,7 @@ def insert_transcript_intelligence(
 
     db.table("transcript_intelligence").upsert(
         row,
-        on_conflict="creator_id,analyzed_at_date",
+        on_conflict="creator_id,platform",
     ).execute()
     logger.info(f"Upserted transcript intelligence for {creator_id}")
 
@@ -475,9 +479,334 @@ def insert_audience_intelligence(
 
     db.table("audience_intelligence").upsert(
         row,
-        on_conflict="creator_id,analyzed_at_date",
+        on_conflict="creator_id,platform",
     ).execute()
     logger.info(f"Upserted audience intelligence for {creator_id}")
+
+
+# ── Per-video intelligence (LLM_PER_POST path, migration 076) ────────────────
+
+
+def insert_post_intelligence(db: Client, rows: list[dict]) -> None:
+    """Bulk-upsert per-post intelligence rows (one per analysed video/post).
+
+    Idempotent on (creator_id, platform, item_id). No-op on empty input.
+    """
+    if not rows:
+        return
+    db.table("post_intelligence").upsert(
+        rows,
+        on_conflict="creator_id,platform,item_id",
+    ).execute()
+    logger.info(
+        f"Upserted {len(rows)} post_intelligence rows for {rows[0].get('creator_id')}"
+    )
+
+
+def upsert_creator_distributions(
+    db: Client, creator_id: str, platform: str, dist: dict
+) -> None:
+    """Upsert the rolled-up distribution + median row for the profile charts.
+
+    `dist` is the output of
+    ``aggregate_post_intelligence.aggregate_posts`` (jsonb bucket arrays +
+    median columns + posts_analyzed). Upsert keyed on (creator_id, platform).
+    """
+    row = {"creator_id": str(creator_id), "platform": platform, **dist}
+    db.table("creator_intelligence_distributions").upsert(
+        row,
+        on_conflict="creator_id,platform",
+    ).execute()
+    logger.info(f"Upserted creator distributions for {creator_id}/{platform}")
+
+
+def upsert_post_raw_content(db: Client, rows: list[dict]) -> None:
+    """Bulk-upsert raw per-item source material (transcripts + comments).
+
+    Idempotent on (creator_id, platform, item_id). No-op on empty input.
+    """
+    if not rows:
+        return
+    db.table("post_raw_content").upsert(
+        rows,
+        on_conflict="creator_id,platform,item_id",
+    ).execute()
+    logger.info(
+        f"Upserted {len(rows)} post_raw_content rows for {rows[0].get('creator_id')}"
+    )
+
+
+def store_post_raw_content(
+    db: Client, creator_id: str, platform: str, cip: dict
+) -> None:
+    """Persist per-video transcripts + per-post comments from a CIP.
+
+    Runs UNCONDITIONALLY at scrape time (not gated on LLM_PER_POST) so per-post
+    analysis can be (re-)run later without re-scraping. Reuses the same
+    item-assembly the per-post analyzer uses, so transcripts/comments are
+    matched to items identically. Failures are swallowed — raw persistence must
+    never break the main CIP write.
+    """
+    try:
+        from pipeline import llm_post
+
+        if platform == "instagram":
+            posts = (cip.get("_raw_posts") or []) + (cip.get("_raw_reels") or [])
+        else:
+            posts = cip.get("videos")
+        if not posts:
+            return
+        transcripts = cip.get("transcripts") or []
+        comments_by_post = (cip.get("comments") or {}).get("_comments_by_post")
+        items, _ = llm_post.build_items(
+            platform, posts, transcripts, comments_by_post
+        )
+        rows: list[dict] = []
+        for it in items:
+            tr = it.get("transcript") or {}
+            comments = it.get("comments") or []
+            ttext = tr.get("transcript_text")
+            if not ttext and not comments:
+                continue  # nothing worth persisting for this item
+            rows.append({
+                "creator_id": str(creator_id),
+                "platform": platform,
+                "item_id": it["item_id"],
+                "transcript_text": ttext,
+                "hook_text": tr.get("hook_text"),
+                "is_likely_music": bool(tr.get("is_likely_music")),
+                "reel_length_seconds": tr.get("reel_length_seconds"),
+                "comments": comments,
+            })
+        upsert_post_raw_content(db, rows)
+    except Exception as e:  # noqa: BLE001 — never break the main write
+        logger.warning(
+            f"store_post_raw_content failed for {creator_id}/{platform}: {e}"
+        )
+
+
+def store_post_intelligence(
+    db: Client, creator_id: str, platform: str, cip: dict
+) -> None:
+    """Persist per-post intelligence + distributions from a CIP, if present.
+
+    Reads the per-post payloads the orchestrator stashed on the CIP under
+    ``_post_payloads`` (and optional ``_post_item_meta``). No-op when the
+    per-post path didn't run (legacy creator-level path only). Failures are
+    swallowed — per-post storage must never break the main CIP write.
+    """
+    payloads = cip.get("_post_payloads")
+    if not payloads:
+        return
+    try:
+        from pipeline.aggregate_post_intelligence import (
+            aggregate_posts,
+            build_post_rows,
+        )
+
+        item_meta = cip.get("_post_item_meta") or {}
+        rows = build_post_rows(str(creator_id), platform, payloads, item_meta)
+        insert_post_intelligence(db, rows)
+        dist = aggregate_posts(payloads, item_meta)
+        upsert_creator_distributions(db, str(creator_id), platform, dist)
+    except Exception as e:  # noqa: BLE001 — never break the main write
+        logger.warning(
+            f"store_post_intelligence failed for {creator_id}/{platform}: {e}"
+        )
+
+
+def store_brand_post_content(
+    db: Client, brand_id: str, platform: str, cip: dict
+) -> None:
+    """Persist a BRAND's own per-video content (transcripts + per-post
+    intelligence) + rolled-up content distributions, so we can analyse what
+    content works for the brand. Keyed by brand_id (delete+insert) so the
+    creator path's constraints stay untouched. No-op when per-video didn't run.
+    Failures are swallowed — must never break the brand scrape.
+    """
+    try:
+        from pipeline.aggregate_post_intelligence import (
+            aggregate_posts,
+            build_post_rows,
+        )
+        from pipeline import llm_post
+
+        bid = str(brand_id)
+        payloads = cip.get("_post_payloads") or []
+        item_meta = cip.get("_post_item_meta") or {}
+
+        # Per-post intelligence (replace this brand's rows for the platform).
+        rows = build_post_rows(bid, platform, payloads, item_meta, owner_col="brand_id")
+        if rows:
+            db.table("post_intelligence").delete().eq(
+                "brand_id", bid).eq("platform", platform).execute()
+            db.table("post_intelligence").insert(rows).execute()
+            dist = aggregate_posts(payloads, item_meta)
+            db.table("brand_platform_analyses").update(
+                {"content_distributions": dist}
+            ).eq("brand_id", bid).eq("platform", platform).execute()
+
+        # Raw content: transcripts + per-post comments.
+        posts = (cip.get("_raw_posts") or []) + (cip.get("_raw_reels") or [])
+        transcripts = cip.get("transcripts") or []
+        comments_by_post = (cip.get("comments") or {}).get("_comments_by_post")
+        if posts:
+            items, _ = llm_post.build_items(
+                platform, posts, transcripts, comments_by_post
+            )
+            raw_rows: list[dict] = []
+            for it in items:
+                tr = it.get("transcript") or {}
+                comments = it.get("comments") or []
+                ttext = tr.get("transcript_text")
+                if not ttext and not comments:
+                    continue
+                raw_rows.append({
+                    "brand_id": bid, "platform": platform, "item_id": it["item_id"],
+                    "transcript_text": ttext, "hook_text": tr.get("hook_text"),
+                    "is_likely_music": bool(tr.get("is_likely_music")),
+                    "reel_length_seconds": tr.get("reel_length_seconds"),
+                    "comments": comments,
+                })
+            if raw_rows:
+                db.table("post_raw_content").delete().eq(
+                    "brand_id", bid).eq("platform", platform).execute()
+                db.table("post_raw_content").insert(raw_rows).execute()
+        logger.info(
+            "Stored brand content for %s/%s: %d post-intel, posts=%d",
+            bid, platform, len(rows), len(posts),
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"store_brand_post_content failed for brand {brand_id}: {e}")
+
+
+# ── Brand affinity (Phase 5, migration 078) ─────────────────────────────────
+
+# Reliability weight per signal type (how strongly it implies a real
+# relationship). Confidence = reliability × match-basis × (freshness, later).
+AFFINITY_RELIABILITY = {
+    "follows": 0.92,
+    "tag_collab": 0.95,
+    "paid_partnership": 0.95,
+    "brand_tags_creator": 0.90,
+    "comment_on_brand": 0.82,
+    "liker": 0.50,
+    "caption_mention": 0.55,
+}
+
+
+def upsert_brand_engagement_roster(db: Client, rows: list[dict]) -> None:
+    """Cache brand-side engagers (commenters / tagged) — one row per
+    (brand_id, platform, signal_type, handle). No-op on empty."""
+    if not rows:
+        return
+    db.table("brand_engagement_roster").upsert(
+        rows, on_conflict="brand_id,platform,signal_type,handle"
+    ).execute()
+
+
+def upsert_brand_affinity_edges(db: Client, rows: list[dict]) -> None:
+    """Bulk-upsert affinity edges — one row per
+    (brand_id, creator_id, platform, signal_type). No-op on empty."""
+    if not rows:
+        return
+    db.table("brand_affinity_edges").upsert(
+        rows, on_conflict="brand_id,creator_id,platform,signal_type"
+    ).execute()
+
+
+def recompute_creator_brand_affinity(
+    db: Client, brand_id: str, creator_id: str
+) -> None:
+    """Roll a creator's edges (for one brand) up into creator_brand_affinity.
+
+    affinity_score = noisy-OR over edge confidences (independent evidence
+    compounds without exceeding 1). Tier by score; follows/engages/mentions
+    flags by signal type; top 3 edges as evidence for the UI.
+    """
+    edges = (
+        db.table("brand_affinity_edges")
+        .select("signal_type, confidence, evidence, evidence_status, observed_at")
+        .eq("brand_id", brand_id)
+        .eq("creator_id", creator_id)
+        .execute()
+        .data
+        or []
+    )
+    real = [e for e in edges if e.get("evidence_status") != "unavailable"]
+    if not real:
+        return
+
+    prod = 1.0
+    sigs: set[str] = set()
+    follows = engages = mentions = False
+    for e in real:
+        conf = float(e.get("confidence") or 0)
+        prod *= 1 - conf
+        st = e.get("signal_type") or ""
+        sigs.add(st)
+        if st == "follows":
+            follows = True
+        elif st in ("comment_on_brand", "liker"):
+            engages = True
+        elif st in ("caption_mention", "tag_collab", "paid_partnership",
+                    "brand_tags_creator"):
+            mentions = True
+
+    score = round(1 - prod, 3)
+    tier = (
+        "strong" if score >= 0.85
+        else "moderate" if score >= 0.6
+        else "weak" if score > 0
+        else "none"
+    )
+    top_evidence = [
+        {"signal_type": e.get("signal_type"), "confidence": e.get("confidence"),
+         "evidence": e.get("evidence")}
+        for e in sorted(real, key=lambda e: float(e.get("confidence") or 0), reverse=True)[:3]
+    ]
+    db.table("creator_brand_affinity").upsert(
+        {
+            "brand_id": brand_id,
+            "creator_id": creator_id,
+            "affinity_score": score,
+            "affinity_tier": tier,
+            "follows": follows,
+            "engages": engages,
+            "mentions": mentions,
+            "signal_types": sorted(sigs),
+            "top_evidence": top_evidence,
+        },
+        on_conflict="brand_id,creator_id",
+    ).execute()
+
+
+def _mark_for_embedding(db: Client, creator_id: str, platform: str) -> None:
+    """Signal the `scripts/embed_creators.py` worker that this creator's
+    brief should be (re-)computed for hybrid search.
+
+    Upserts a row in `creator_embeddings` with `embedding=NULL` so the
+    worker's `embedding IS NULL` filter picks it up next pass. Cheap
+    (one round-trip) and idempotent — safe to call after every CIP write.
+
+    Failures are swallowed: an embedding queue glitch must never break
+    the main pipeline write. The worker will eventually re-scan and
+    catch up.
+    """
+    try:
+        db.table("creator_embeddings").upsert(
+            {
+                "creator_id": str(creator_id),
+                "platform": platform,
+                "embedding": None,
+                "embedded_at": None,
+            },
+            on_conflict="creator_id,platform",
+        ).execute()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            f"Failed to enqueue embedding refresh for {creator_id}/{platform}: {e}"
+        )
 
 
 def store_full_cip(
@@ -508,7 +837,11 @@ def store_full_cip(
     """
     profile = cip.get("profile", {})
     if USE_TX_RPC and not existing_creator_id:
-        return _store_full_cip_via_rpc(db, cip)
+        creator_id = _store_full_cip_via_rpc(db, cip)
+        store_post_raw_content(db, creator_id, "instagram", cip)
+        store_post_intelligence(db, creator_id, "instagram", cip)
+        _mark_for_embedding(db, creator_id, "instagram")
+        return creator_id
 
     if existing_creator_id:
         creator_id = existing_creator_id
@@ -517,8 +850,9 @@ def store_full_cip(
     else:
         creator_id = upsert_creator(db, profile)
 
-    # Store raw posts
-    raw_posts = cip.get("_raw_posts", [])
+    # Store raw posts + reels (reels were previously dropped from the posts
+    # table — so the grid missed them and their thumbnails never persisted).
+    raw_posts = (cip.get("_raw_posts") or []) + (cip.get("_raw_reels") or [])
     if raw_posts:
         upsert_posts(db, creator_id, raw_posts)
 
@@ -549,6 +883,13 @@ def store_full_cip(
     if aud and not (isinstance(aud, dict) and aud.get("_llm_failure")):
         insert_audience_intelligence(db, creator_id, aud)
 
+    # Raw source material (transcripts + comments) — always persisted so
+    # per-post analysis can be (re-)run later without re-scraping.
+    store_post_raw_content(db, creator_id, "instagram", cip)
+    # Per-post intelligence + distributions (LLM_PER_POST path; no-op otherwise)
+    store_post_intelligence(db, creator_id, "instagram", cip)
+
+    _mark_for_embedding(db, creator_id, "instagram")
     logger.info(f"Stored full CIP for @{profile.get('handle')} -> {creator_id}")
     return creator_id
 
@@ -797,6 +1138,36 @@ def fail_background_job(db: Client, job_id: str, error_message: str) -> None:
     ).eq("id", job_id).execute()
 
 
+def get_background_job(db: Client, job_id: str) -> dict | None:
+    """Fetch one background_jobs row by id (no status filter).
+
+    Used by the webhook handler and recovery sweep — both need to read
+    the current payload state for a job that may already be `running`.
+    """
+    result = (
+        db.table("background_jobs")
+        .select("*")
+        .eq("id", job_id)
+        .limit(1)
+        .execute()
+    )
+    return result.data[0] if result.data else None
+
+
+def update_background_job_payload(
+    db: Client, job_id: str, payload: dict
+) -> None:
+    """Replace background_jobs.payload (jsonb) wholesale.
+
+    The caller is responsible for merging — Supabase's PostgREST doesn't
+    expose jsonb_set in a clean way, so we read-modify-write at the
+    application layer.
+    """
+    db.table("background_jobs").update(
+        {"payload": payload, "updated_at": datetime.utcnow().isoformat()}
+    ).eq("id", job_id).execute()
+
+
 def get_brand_products(db: Client, brand_id: str) -> list[dict]:
     """Fetch Shopify products for a brand."""
     result = (
@@ -871,10 +1242,21 @@ def upsert_social_profile(
     youtube.scraper_channels.extract_channel_metrics or the IG-side
     extract_profile_metrics (wrapped with a platform key).
     """
+    # Handle-less YT channels (legacy /channel/UC... URLs that never claimed
+    # an @-handle) come back from the API with handle=None. The
+    # creator_social_profiles.handle column is NOT NULL, so we fall back
+    # to the channel_id (platform_user_id) as a synthetic handle. The
+    # matching engine and outreach flows read by creator_id, not by handle
+    # string, so this stub is operationally fine.
+    handle_value = (
+        profile.get("handle")
+        or profile.get("platform_user_id")
+        or profile.get("instagram_id")
+    )
     row = {
         "creator_id": creator_id,
         "platform": platform,
-        "handle": profile["handle"],
+        "handle": handle_value,
         "platform_user_id": profile.get("platform_user_id")
         or profile.get("instagram_id"),
         "profile_url": profile.get("profile_url"),
@@ -976,26 +1358,36 @@ def upsert_creator_score_platform(
 
 
 def upsert_creator_platform_embedding(
-    db: Client, creator_id: str, platform: str, embedding: list[float]
+    db: Client,
+    creator_id: str,
+    platform: str,
+    embedding: list[float],
+    content_text: str | None = None,
 ) -> None:
-    """Write a per-platform content embedding (migration 046).
+    """Write a per-platform content embedding to ``creator_embeddings``.
 
-    Replaces the single-valued `creators.content_embedding` for scoring
-    purposes. A YT rescrape no longer overwrites IG's DNA vector.
-    Existing `creators.content_embedding` is kept as a shadow for one
-    release — IG callers should populate both this table AND the shadow
-    column until the shadow is dropped in the follow-up migration.
+    The matching engine reads ``creator_embeddings`` (see
+    web/src/lib/matching/engine.ts:1332-1336) — the original
+    ``creator_content_embeddings`` table from migration 046 was deprecated
+    and never backfilled.
+
+    ``content_text`` is the BM25 FTS source string built via
+    ``pipeline.embeddings.build_creator_embedding_input(cip)``. It's
+    required: the BM25 hybrid-search path on the matching side reads
+    ``content_text_tsv`` (a generated column derived from this).
     """
     if not embedding:
         return
-    db.table("creator_content_embeddings").upsert(
-        {
-            "creator_id": creator_id,
-            "platform": platform,
-            "embedding": embedding,
-            "computed_at": datetime.now().isoformat(),
-        },
-        on_conflict="creator_id,platform",
+    row: dict[str, Any] = {
+        "creator_id": creator_id,
+        "platform": platform,
+        "embedding": embedding,
+        "embedded_at": datetime.now().isoformat(),
+    }
+    if content_text:
+        row["content_text"] = content_text
+    db.table("creator_embeddings").upsert(
+        row, on_conflict="creator_id,platform"
     ).execute()
     logger.debug(
         f"Upserted {platform} content embedding for creator {creator_id}"
@@ -1061,13 +1453,21 @@ def _find_creator_by_platform_profile(
 
 
 def _create_youtube_creator_shell(db: Client, profile: dict) -> str:
-    """Create a minimal `creators` row for a YouTube-first creator.
+    """Create / re-use a minimal `creators` row for a YouTube-first creator.
 
     The legacy `creators` table requires `handle`. For YT-primary creators
     we use the YT handle (strip leading @). A follow-up migration will let
     `creators.handle` go nullable — until then this keeps the NOT NULL
     constraint satisfied without colliding with IG handles (YT handles
     can legally collide with IG; we suffix `_yt` on collision).
+
+    Uses upsert-on-conflict-handle to be safe under:
+      - parallel workers racing on the same channel,
+      - re-runs where the previous run created the creators row but its
+        creator_social_profiles linkage didn't persist, leaving
+        `_find_creator_by_platform_profile` blind to the existing shell.
+    Both cases used to surface as `duplicate key value violates unique
+    constraint "creators_handle_key"`.
     """
     handle_base = profile.get("handle") or profile.get("platform_user_id") or ""
     handle = handle_base
@@ -1096,7 +1496,12 @@ def _create_youtube_creator_shell(db: Client, profile: dict) -> str:
         "contact_phone": profile.get("phone"),
         "last_scraped_at": datetime.now().isoformat(),
     }
-    result = db.table("creators").insert(row).execute()
+    # Upsert (not insert): handle existed because either a parallel worker
+    # just created it, or a previous run created the shell and we lost the
+    # creator_social_profiles linkage. Either way we want the existing id.
+    result = (
+        db.table("creators").upsert(row, on_conflict="handle").execute()
+    )
     return result.data[0]["id"]
 
 
@@ -1204,6 +1609,12 @@ def store_youtube_cip(
     if ai and not (isinstance(ai, dict) and ai.get("_llm_failure")):
         insert_audience_intelligence(db, creator_id, ai, platform="youtube")
 
+    # Raw source material (transcripts + comments) — always persisted.
+    store_post_raw_content(db, creator_id, "youtube", cip)
+    # Per-post intelligence + distributions (LLM_PER_POST path; no-op otherwise)
+    store_post_intelligence(db, creator_id, "youtube", cip)
+
+    _mark_for_embedding(db, creator_id, "youtube")
     logger.info(
         f"Stored YouTube CIP for creator {creator_id} "
         f"(channel_id={resolved.get('channel_id')})"

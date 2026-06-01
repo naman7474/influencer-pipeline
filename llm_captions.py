@@ -7,6 +7,25 @@ from pipeline.schemas.intelligence import (
     is_llm_failure,
 )
 
+# Single source of truth for niche classification. The TS side mirrors this
+# in web/src/lib/matching/types.ts (NICHE_ENUM); both must stay in sync so
+# brand niche classification and creator caption classification produce
+# values that the matcher's computeNicheFit can compare directly.
+CAPTION_NICHES: tuple[str, ...] = (
+    "beauty",
+    "fashion",
+    "lifestyle",
+    "tech",
+    "food",
+    "fitness",
+    "travel",
+    "education",
+    "entertainment",
+    "parenting",
+    "health",
+    "finance",
+)
+
 CAPTION_ANALYSIS_PROMPT = """You are an influencer marketing analyst. Analyze the following Instagram captions from a single creator and extract structured intelligence.
 
 CREATOR HANDLE: {handle}

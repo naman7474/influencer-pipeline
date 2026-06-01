@@ -15,3 +15,10 @@ openai==2.29.0
 
 # ── Data validation ────────────────────────────────────────────────────
 pydantic==2.12.5
+
+# ── Crypto: AES-256-GCM decoding parity with
+#    web/src/lib/instagram/token-encryption.ts ──────────────────────────
+cryptography==43.0.3
+
+# ── Modal SDK for the Whisper sidecar (Phase 3) ────────────────────────
+modal>=0.64.0

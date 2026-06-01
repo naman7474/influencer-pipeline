@@ -1,66 +1,35 @@
-"""YouTube video discovery — API-primary (Phase 2.5), Bright Data fallback.
+"""YouTube video discovery — YouTube Data API v3 only.
 
-Post-Phase-2.5, this module uses the YouTube Data API as the primary video
-discovery source:
+Uses the YouTube Data API as the sole video discovery source:
   - ~3 quota units per channel (channels.list + playlistItems.list + videos.list)
   - Canonical stats (views/likes/comments fresh from the source)
   - Free within the 10K/day default quota (~3300 channels/day on one key)
 
-Bright Data is kept as a fallback for when the API is unavailable (no key,
-quota exhausted, network partition). Set YT_SCRAPER_PREFER_BRIGHTDATA=1 to
-force Bright Data even when the API is available (useful when API quota is
-near exhaustion and we'd rather pay Bright Data's per-record fee).
-
 Parallel to pipeline/scraper_reels.py + scraper_posts.py combined.
 """
 
-import os
-
-from pipeline.brightdata_client import BrightdataClient
 from pipeline.youtube.youtube_api import YouTubeAPIClient
-
-DATASET_YT_VIDEOS = os.environ.get(
-    "BRIGHTDATA_DATASET_YT_VIDEOS", "gd_lk538kybj9ll3fpaxj"
-)
-
-
-def _prefer_bright_data() -> bool:
-    return os.environ.get("YT_SCRAPER_PREFER_BRIGHTDATA", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
 
 
 def scrape_videos_discovery(
-    bd_client: BrightdataClient,
-    channel_url: str,
+    channel_url: str,  # noqa: ARG001 — kept in signature for symmetry; api path
+                       # works off channel_id, not url
     num_videos: int = 20,
-    yt_api: YouTubeAPIClient | None = None,
-    channel_id: str | None = None,
+    *,
+    yt_api: YouTubeAPIClient,
+    channel_id: str,
 ) -> list[dict]:
-    """Discover recent videos for a channel.
+    """Discover recent videos for a channel via the YouTube Data API.
 
-    API-first when `yt_api` is available and `channel_id` is provided.
-    Falls back to Bright Data when either is missing or when the caller
-    has set YT_SCRAPER_PREFER_BRIGHTDATA=1.
-
-    Returns records matching the Bright Data shape so `extract_video_metrics`
-    works unchanged. The API path normalizes to the same keys (url, views,
-    likes, num_comments, length, published_at, etc.).
+    Returns records normalized to the same keys ``extract_video_metrics``
+    expects (url, views, likes, num_comments, length, published_at, etc.).
     """
-    # Prefer the API unless forced to Bright Data or the prerequisites are
-    # missing.
-    use_api = (
-        not _prefer_bright_data()
-        and yt_api is not None
-        and yt_api.available
-        and channel_id
-    )
-    if use_api:
-        return _discover_via_api(yt_api, channel_id, num_videos)
-
-    return _discover_via_bright_data(bd_client, channel_url, num_videos)
+    if not yt_api or not yt_api.available or not channel_id:
+        raise RuntimeError(
+            "scrape_videos_discovery requires a configured YouTubeAPIClient "
+            "and a channel_id."
+        )
+    return _discover_via_api(yt_api, channel_id, num_videos)
 
 
 def _discover_via_api(
@@ -106,10 +75,16 @@ def _api_record_to_bd_shape(rec: dict) -> dict:
         "like_count": rec.get("like_count") or 0,
         "num_comments": rec.get("comment_count") or 0,
         "comment_count": rec.get("comment_count") or 0,
-        # metadata
-        "thumbnail": None,  # API's snippet.thumbnails.default.url — not
-        # currently fetched to keep quota low; add back if needed.
-        "thumbnail_url": None,
+        # metadata — synthesize thumbnail from the public ytimg CDN. No
+        # API call needed: every public video has hqdefault.jpg at this
+        # URL pattern. maxresdefault.jpg only exists for HD uploads, so
+        # hqdefault is the safer choice for a unified fallback.
+        "thumbnail": (
+            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else None
+        ),
+        "thumbnail_url": (
+            f"https://i.ytimg.com/vi/{video_id}/hqdefault.jpg" if video_id else None
+        ),
         "date_posted": rec.get("published_at"),
         "published_at": rec.get("published_at"),
         # captions: the API exposes contentDetails.caption which
@@ -144,25 +119,6 @@ def _iso8601_duration_to_seconds(iso: str | None) -> float:
     mi = int(m.group(2) or 0)
     s = int(m.group(3) or 0)
     return float(h * 3600 + mi * 60 + s)
-
-
-def _discover_via_bright_data(
-    client: BrightdataClient,
-    channel_url: str,
-    num_videos: int,
-) -> list[dict]:
-    """Fallback path — the original Bright Data discovery flow."""
-    input_obj = {
-        "url": channel_url,
-        "num_of_posts": num_videos,
-        "start_date": "",
-        "end_date": "",
-    }
-    extra_params = {
-        "type": "discover_new",
-        "discover_by": "url_all_videos",
-    }
-    return client.scrape_and_wait(DATASET_YT_VIDEOS, [input_obj], extra_params)
 
 
 def select_top_videos(

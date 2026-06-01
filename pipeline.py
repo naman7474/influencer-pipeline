@@ -2,7 +2,6 @@ import copy
 import logging
 from datetime import datetime
 
-from pipeline.brightdata_client import BrightdataClient
 from pipeline.scraper_profiles import scrape_profiles, extract_profile_metrics
 from pipeline.scraper_posts import (
     scrape_posts_discovery,
@@ -37,47 +36,74 @@ PIPELINE_VERSION = "1.1"
 
 def build_creator_intelligence_profile(
     profile_url: str,
-    brightdata_token: str,
     gemini_api_key: str,
     openai_api_key: str,
-    num_posts: int = 20,
-    num_reels: int = 5,
+    num_posts: int = 5,
+    num_reels: int = 10,
     num_comment_posts: int = 5,
     days_back: int = 90,
     er_benchmarks: dict | None = None,
+    commerce_signal: dict | None = None,
 ) -> dict:
     """
     Full pipeline: Scrape -> Transcribe -> Analyse -> Compute -> Return CIP.
 
-    Total Brightdata cost per creator: ~$0.11
-      - Profile: 1 record = $0.0015
-      - Posts Discovery (20): 20 records = $0.03
-      - Reels Detail (5): 5 records = $0.0075
-      - Comments (5 posts x 10): 50 records = $0.075
+    Default scrape mix is reels-heavy (10 reels + 5 posts) since influencer
+    evaluation hinges on reels. Comments are sourced from the top reels,
+    not top posts.
 
-    Total Whisper cost per creator: ~$0.015
-      - 5 reels x ~30s avg = 2.5 min at $0.006/min
+    Apify cost per creator: ~$0.066
+      - Profile: $0.002
+      - Posts (5): $0.0135
+      - Reels (10): $0.025
+      - Comments (50): $0.025
 
-    Total Gemini cost per creator: ~$0.002
-      - 3 calls x ~3K tokens avg = ~9K tokens at $0.10/1M
+    Whisper cost per creator (legacy pod path): ~$0.030. Replaced by Modal
+    serverless GPU sidecar in Phase 3.
 
-    GRAND TOTAL: ~$0.13 per creator
+    Gemini cost per creator: ~$0.002 (3 sequential calls — merged to 1 in Phase 4).
     """
     logger.info(f"Starting CIP build for {profile_url}")
 
-    bd_client = BrightdataClient(api_token=brightdata_token)
     gemini_client = init_gemini(gemini_api_key)
+
+    # Hybrid IG-comment policy: if the creator has a commerce signal
+    # (affiliate sales data), that's a stronger audience-purchasing-power
+    # proxy than comment-derived authenticity/sentiment, so skip comment
+    # scraping entirely. Otherwise fall back to a thin scrape (~10 comments
+    # total via 1 per reel) — enough for language detection without paying
+    # for the full 25-comment pull.
+    if commerce_signal:
+        comments_per_reel = 0
+        num_comment_posts = 0
+    else:
+        comments_per_reel = 1
+    logger.info(
+        "  IG comment policy: commerce_signal=%s → comments_per_reel=%d, num_comment_posts=%d",
+        "yes" if commerce_signal else "no",
+        comments_per_reel,
+        num_comment_posts,
+    )
+
+    # Apply the per-reel comment policy before the first bundle.fetch() call
+    # so the cached run honors it.
+    try:
+        from pipeline import apify_instagram_bundle
+        apify_instagram_bundle.set_default_comments_per_reel(comments_per_reel)
+    except Exception as e:  # noqa: BLE001
+        logger.debug("apify bundle setter unavailable: %s", e)
 
     cip = {
         "profile_url": profile_url,
         "pipeline_version": PIPELINE_VERSION,
         "scraped_at": datetime.now().isoformat(),
-        "data_provenance": "brightdata_scraper_api",
+        "data_provenance": "apify_instagram_scraper",
+        "commerce_signal": commerce_signal,  # passes through for downstream consumers
     }
 
     # ── STEP 1: Profile Scrape ──
     logger.info("  [Step 1/6] Scraping profile...")
-    raw_profiles = scrape_profiles(bd_client, [profile_url])
+    raw_profiles = scrape_profiles([profile_url])
 
     if not raw_profiles:
         return {
@@ -95,7 +121,6 @@ def build_creator_intelligence_profile(
     # ── STEP 2: Posts Discovery ──
     logger.info(f"  [Step 2/6] Discovering {num_posts} recent posts...")
     raw_posts = scrape_posts_discovery(
-        bd_client,
         profile_url,
         num_posts=num_posts,
         days_back=days_back,
@@ -105,13 +130,13 @@ def build_creator_intelligence_profile(
         f"  Posts Discovery returned {len(raw_posts)} posts."
     )
 
-    post_metrics = extract_post_metrics(raw_posts, followers, handle=handle)
-    cip["posts"] = post_metrics
     cip["_raw_posts"] = raw_posts  # needed by store_full_cip for DB insert
+    # NOTE: engagement metrics are computed below over posts + reels (reels
+    # carry the dominant signal; excluding them gives a misleadingly low ER).
 
     # ── STEP 3a: Reels Discovery ──
     logger.info(f"  [Step 3a/6] Discovering {num_reels} reels from profile...")
-    raw_reels = scrape_reels_discovery(bd_client, profile_url, num_reels=num_reels)
+    raw_reels = scrape_reels_discovery(profile_url, num_reels=num_reels)
 
     # Filter out reels that don't belong to this creator
     creator_ig_id = profile_metrics.get("instagram_id")
@@ -133,19 +158,42 @@ def build_creator_intelligence_profile(
         reel_metrics = extract_reel_metrics(top_reels)
         cip["reels"] = reel_metrics
     else:
+        top_reels = []
         logger.info("  [Step 3a/6] No reels found, skipping...")
         cip["reels"] = {}
+    # Raw reel records (same shape as posts: post_id/url/description/likes/
+    # views) for per-video analysis + raw-content persistence. Reels carry the
+    # dominant signal and are where comments live, so they MUST be analysed.
+    cip["_raw_reels"] = top_reels
+
+    # Engagement metrics over posts + reels combined. Reels are the dominant
+    # content for most creators; computing ER from the handful of static posts
+    # alone produced an unrealistically low headline rate (e.g. 0.07% when the
+    # reels engage 3-5%).
+    post_metrics = extract_post_metrics(
+        raw_posts + top_reels, followers, handle=handle
+    )
+    cip["posts"] = post_metrics
 
     # ── STEP 3b: Comments ──
-    comment_urls = select_top_posts_for_comments(
-        raw_posts, top_n=num_comment_posts
-    )
+    # Rebased onto top reels (was: top posts) — reels carry the dominant
+    # evaluation signal so comments on reels give us the audience signal
+    # closest to the assets we score on. Falls back to top posts if the
+    # reel scrape returned nothing.
+    if top_reels:
+        comment_urls = select_top_posts_for_comments(
+            top_reels, top_n=num_comment_posts
+        )
+    else:
+        comment_urls = select_top_posts_for_comments(
+            raw_posts, top_n=num_comment_posts
+        )
 
     if comment_urls:
         logger.info(
-            f"  [Step 3b/6] Scraping comments from {len(comment_urls)} posts..."
+            f"  [Step 3b/6] Scraping comments from {len(comment_urls)} sources..."
         )
-        raw_comments = scrape_comments(bd_client, comment_urls)
+        raw_comments = scrape_comments(comment_urls)
         comment_metrics = extract_comment_metrics(raw_comments, handle)
         cip["comments"] = comment_metrics
     else:
@@ -153,38 +201,44 @@ def build_creator_intelligence_profile(
         cip["comments"] = {}
 
     # ── STEP 4: Whisper Transcription ──
+    # In async mode we defer transcription to background jobs — the
+    # critical-path scoring runs without transcripts and an
+    # ``audience_refresh`` job re-scores once they land. The CIP carries
+    # `_async_transcribe_pending=True` so the finalize step knows to
+    # enqueue the fanout.
     video_urls_for_whisper = cip.get("reels", {}).get(
         "video_urls_for_whisper", []
     )
 
-    if video_urls_for_whisper:
+    from pipeline import whisper_client
+
+    if not video_urls_for_whisper:
+        logger.info("  [Step 4/6] No video URLs available, skipping Whisper...")
+        cip["transcripts"] = []
+    elif whisper_client.is_async_mode():
+        logger.info(
+            "  [Step 4/6] WHISPER_ASYNC=1: deferring %d transcripts to background jobs",
+            len(video_urls_for_whisper),
+        )
+        cip["transcripts"] = []
+        cip["_async_transcribe_pending"] = video_urls_for_whisper
+    else:
         logger.info(
             f"  [Step 4/6] Transcribing {len(video_urls_for_whisper)} reels "
-            "with Whisper..."
+            "via Modal Whisper..."
         )
         transcripts = transcribe_reels_whisper(
             video_urls_for_whisper, openai_api_key
         )
         cip["transcripts"] = transcripts
-    else:
-        logger.info("  [Step 4/6] No video URLs available, skipping Whisper...")
-        cip["transcripts"] = []
 
-    # ── STEP 5: Gemini LLM Analysis ──
-    logger.info("  [Step 5/6] Running Gemini analysis...")
+    # ── STEP 5: LLM Analysis ──
+    # Two modes:
+    #   LLM_MERGED=1 → one Sonnet 4.6 call, split into the three keys
+    #   default     → legacy three sequential Gemini calls
+    from pipeline import llm as merged_llm
 
-    # 5a: Caption Analysis
     captions = post_metrics.get("_captions", [])
-    if captions:
-        cip["caption_intelligence"] = analyze_captions(
-            gemini_client,
-            handle=handle,
-            bio=profile_metrics.get("bio", ""),
-            category=profile_metrics.get("category", ""),
-            captions=captions,
-        )
-
-    # 5b: Transcript Analysis (filter out music-only transcripts)
     valid_transcripts = [
         t for t in cip.get("transcripts", [])
         if t.get("transcript_text") and not t.get("is_likely_music", False)
@@ -196,33 +250,82 @@ def build_creator_intelligence_profile(
         logger.info(
             f"  Filtered {music_count} music-only transcript(s) from LLM analysis"
         )
-    if valid_transcripts:
-        cip["transcript_intelligence"] = analyze_transcripts(
-            gemini_client,
-            handle=handle,
-            transcripts=valid_transcripts,
-        )
 
-    # 5c: Comment Analysis
-    comment_texts = cip.get("comments", {}).get("_comment_texts", [])
-    if comment_texts:
-        cip["audience_intelligence"] = analyze_comments(
-            gemini_client,
+    comments_dict = cip.get("comments") or {}
+    comment_texts = comments_dict.get("_comment_texts") or []
+
+    if merged_llm.is_merged_mode():
+        logger.info("  [Step 5/6] Running merged LLM (Claude Sonnet 4.6)...")
+        merged_input_comments: list[dict] = []
+        commenter_handles = comments_dict.get("_commenter_handles") or []
+        comment_timestamps = comments_dict.get("_comment_timestamps") or []
+        for i, txt in enumerate(comment_texts[:50]):
+            merged_input_comments.append(
+                {
+                    "user": commenter_handles[i] if i < len(commenter_handles) else None,
+                    "text": txt,
+                    "timestamp": comment_timestamps[i] if i < len(comment_timestamps) else None,
+                }
+            )
+        merged = merged_llm.evaluate_creator(
             handle=handle,
-            comment_texts=comment_texts,
-            comment_timestamps=cip.get("comments", {}).get(
-                "_comment_timestamps"
-            ),
-            commenter_handles=cip.get("comments", {}).get(
-                "_commenter_handles"
-            ),
-            comment_hour_distribution=cip.get("comments", {}).get(
+            bio=profile_metrics.get("bio") or "",
+            category=profile_metrics.get("category") or "",
+            captions=captions,
+            transcripts=valid_transcripts,
+            comments=merged_input_comments or None,
+            comment_hour_distribution=comments_dict.get(
                 "comment_hour_distribution_utc"
             ),
-            num_posts_with_comments=len(
-                cip.get("comments", {}).get("_comment_texts", [])
-            ),
         )
+        dims = merged_llm.split_into_dimensions(merged)
+        for key, payload in dims.items():
+            cip[key] = payload
+    else:
+        logger.info("  [Step 5/6] Running Gemini analysis (legacy three-call)...")
+        if captions:
+            cip["caption_intelligence"] = analyze_captions(
+                gemini_client,
+                handle=handle,
+                bio=profile_metrics.get("bio", ""),
+                category=profile_metrics.get("category", ""),
+                captions=captions,
+            )
+        if valid_transcripts:
+            cip["transcript_intelligence"] = analyze_transcripts(
+                gemini_client,
+                handle=handle,
+                transcripts=valid_transcripts,
+            )
+        if comment_texts:
+            cip["audience_intelligence"] = analyze_comments(
+                gemini_client,
+                handle=handle,
+                comment_texts=comment_texts,
+                comment_timestamps=comments_dict.get("_comment_timestamps"),
+                commenter_handles=comments_dict.get("_commenter_handles"),
+                comment_hour_distribution=comments_dict.get(
+                    "comment_hour_distribution_utc"
+                ),
+                num_posts_with_comments=len(comment_texts),
+            )
+
+    # ── STEP 5b: Per-video analysis (LLM_PER_POST, runs ALONGSIDE the
+    # creator-level path above; stashes payloads on the CIP for db.store) ──
+    from pipeline import llm_post
+
+    if llm_post.is_per_post_mode():
+        logger.info("  [Step 5b] Running per-video analysis (OpenRouter)...")
+        payloads, item_meta = llm_post.run_per_post_analysis(
+            handle,
+            "instagram",
+            posts=(cip.get("_raw_posts") or []) + (cip.get("_raw_reels") or []),
+            transcripts=cip.get("transcripts", []),
+            comments_by_post=(cip.get("comments") or {}).get("_comments_by_post"),
+        )
+        cip["_post_payloads"] = payloads
+        cip["_post_item_meta"] = item_meta
+        logger.info(f"  [Step 5b] Analysed {len(payloads)} posts per-video")
 
     # ── STEP 6: Compute Final Scores ──
     logger.info("  [Step 6/6] Computing Creator Performance Index...")
@@ -388,10 +491,14 @@ def _channel_age_years(created_iso: str | None) -> float | None:
 def _classify_audio_quality(transcripts: list[dict]) -> str:
     """Classify audio quality from Whisper confidence scores instead of LLM guessing."""
     confidences = [
-        t.get("avg_confidence", 0)
+        t["avg_confidence"]
         for t in transcripts
-        if t.get("transcript_text") and not t.get("is_likely_music", False)
+        if t.get("transcript_text")
+        and not t.get("is_likely_music", False)
+        and isinstance(t.get("avg_confidence"), (int, float))
     ]
+    # Some transcript sources (e.g. OpenAI whisper-1) don't return a
+    # confidence score — fall back to "casual" rather than crashing.
     if not confidences:
         return "casual"
     avg = sum(confidences) / len(confidences)
@@ -718,7 +825,6 @@ def _strip_internal_fields(obj):
 
 def build_youtube_creator_intelligence_profile(
     channel_url: str,
-    brightdata_token: str,
     gemini_api_key: str,
     openai_api_key: str,
     youtube_api_key: str | None = None,
@@ -729,11 +835,10 @@ def build_youtube_creator_intelligence_profile(
 
     Stages:
       1. Resolve the URL -> (channel_id, canonical url) via handle_resolver.
-      2. Bright Data channel scrape: profile / subs / about / external links.
-      3. Bright Data video discovery: top N recent videos.
-      4. Transcription: prefer inline captions from Bright Data; fall back
-         to Whisper only when captions are absent.
-      5. Gemini analysis: captions (video description + title + tags),
+      2. YouTube Data API channel fetch: stats, description, links.
+      3. YouTube Data API video discovery: top N recent videos.
+      4. Transcription: tier-1 youtube-transcript-api, tier-2 Whisper.
+      5. Gemini analysis: captions (description + title + tags),
          transcripts, top-video comments.
       6. Scoring: compute_creator_scores() with YT ER benchmarks and YT
          inputs (views_per_sub, watch_through_proxy, upload cadence).
@@ -762,7 +867,6 @@ def build_youtube_creator_intelligence_profile(
     from pipeline.confidence import YT_ER_BENCHMARKS
 
     logger.info(f"Starting YT CIP build for {channel_url}")
-    bd_client = BrightdataClient(api_token=brightdata_token)
     yt_api = YouTubeAPIClient(api_key=youtube_api_key)
 
     cip: dict = {
@@ -770,7 +874,7 @@ def build_youtube_creator_intelligence_profile(
         "profile_url": channel_url,
         "pipeline_version": PIPELINE_VERSION,
         "scraped_at": datetime.now().isoformat(),
-        "data_provenance": "brightdata_scraper_api+youtube_data_api_v3",
+        "data_provenance": "youtube_data_api_v3",
     }
 
     try:
@@ -782,33 +886,24 @@ def build_youtube_creator_intelligence_profile(
             "handle": resolved.handle,
             "url": canonical_url,
         }
+        if not resolved.channel_id:
+            return {**cip, "error": "could not resolve channel_id"}
 
-        # ── STEP 2: channel scrape ──
-        logger.info("  [Step 1/6] Scraping YouTube channel...")
-        raw_channels = scrape_channels(bd_client, [canonical_url])
+        # ── STEP 2: channel scrape via YT API ──
+        logger.info("  [Step 1/6] Fetching YouTube channel via API...")
+        raw_channels = scrape_channels(
+            [canonical_url],
+            yt_api=yt_api,
+            channel_ids=[resolved.channel_id],
+        )
         if not raw_channels:
-            return {**cip, "error": "no channel data from brightdata"}
+            return {**cip, "error": "no channel data from youtube api"}
         profile = extract_channel_metrics(raw_channels[0])
-        # Prefer YT Data API stats for headline numbers when available —
-        # Bright Data's scraped subscriber counts can drift by hours/days.
-        if resolved.channel_id and yt_api.available:
-            stats = yt_api.fetch_channel_stats([resolved.channel_id]).get(
-                resolved.channel_id
-            )
-            if stats:
-                profile["followers_or_subs"] = (
-                    stats.get("subscriber_count") or profile["followers_or_subs"]
-                )
-                profile["posts_or_videos_count"] = (
-                    stats.get("video_count") or profile["posts_or_videos_count"]
-                )
-                profile["topic_categories"] = stats.get("topic_categories") or []
         cip["profile"] = profile
 
-        # ── STEP 3: video discovery (API-primary, BD fallback) ──
+        # ── STEP 3: video discovery via YT API ──
         logger.info("  [Step 2/6] Discovering recent videos...")
         raw_videos = scrape_videos_discovery(
-            bd_client,
             canonical_url,
             num_videos,
             yt_api=yt_api,
@@ -828,20 +923,44 @@ def build_youtube_creator_intelligence_profile(
             "avg_views_per_sub": avg_views_per_sub,
         }
 
-        # ── STEP 4: transcripts (tiered: youtube-transcript-api → BD → Whisper) ──
-        from pipeline.youtube.transcripts import fetch_transcript
+        # ── STEP 4: transcripts (tier-1 inline; Modal tier-2 sync or async) ──
+        from pipeline.youtube.transcripts import _try_transcript_api, fetch_transcript
+        from pipeline import whisper_client
 
         logger.info("  [Step 3/6] Gathering transcripts...")
+        async_mode = whisper_client.is_async_mode()
         transcripts: list[dict] = []
+        async_pending: list[dict] = []
         for v in [extract_video_metrics(x) for x in top_for_transcripts]:
             vid = v.get("video_id")
             vurl = v.get("url")
             if not vid or not vurl:
                 continue
+            t1 = _try_transcript_api(vid)
+            if t1 is not None:
+                transcripts.append(
+                    {
+                        "video_id": t1["video_id"],
+                        "post_id": t1["video_id"],
+                        "transcript_text": t1["text"],
+                        "caption_source": t1["source"],
+                    }
+                )
+                continue
+            if async_mode:
+                async_pending.append(
+                    {
+                        "video_url": vurl,
+                        "video_id": vid,
+                        "caption": v.get("title") or v.get("description") or "",
+                        "duration_seconds": v.get("duration_seconds"),
+                    }
+                )
+                continue
+            # Sync fallback: Modal Whisper via the tiered fetcher.
             tr = fetch_transcript(
                 video_id=vid,
                 video_url=vurl,
-                bd_client=bd_client,
                 openai_key=openai_api_key,
                 duration_seconds=v.get("duration_seconds"),
             )
@@ -850,19 +969,24 @@ def build_youtube_creator_intelligence_profile(
             transcripts.append(
                 {
                     "video_id": tr["video_id"],
-                    # `post_id` alias so analyze_transcripts (IG-shaped) works.
                     "post_id": tr["video_id"],
                     "transcript_text": tr["text"],
                     "caption_source": tr["source"],
                 }
             )
+        if async_pending:
+            logger.info(
+                "  [Step 3/6] WHISPER_ASYNC=1: deferring %d transcripts to background jobs",
+                len(async_pending),
+            )
+            cip["_async_transcribe_pending"] = async_pending
         cip["transcripts"] = transcripts
 
-        # ── STEP 5: comments (API-primary, BD fallback) + Gemini analysis ──
+        # ── STEP 5: comments via YT API + Gemini analysis ──
         logger.info("  [Step 4/6] Scraping comments...")
         comment_video_urls = select_top_videos_for_comments(videos, top_n=5)
         raw_comments = (
-            scrape_yt_comments(bd_client, comment_video_urls, yt_api=yt_api)
+            scrape_yt_comments(comment_video_urls, yt_api=yt_api)
             if comment_video_urls
             else []
         )
@@ -873,43 +997,93 @@ def build_youtube_creator_intelligence_profile(
         )
         cip["comments"] = comment_metrics
 
-        logger.info("  [Step 5/6] Running Gemini analysis...")
-        gemini_client = init_gemini(gemini_api_key)
+        from pipeline import llm as merged_llm
+
         creator_handle = profile.get("handle") or ""
-        try:
-            cip["caption_intelligence"] = analyze_captions(
-                gemini_client,
+        yt_captions = [
+            v.get("description") or v.get("title") or "" for v in videos
+        ]
+        yt_comment_texts = comment_metrics.get("_comment_texts", []) or []
+        yt_commenter_handles = comment_metrics.get("_commenter_handles", []) or []
+        yt_comment_timestamps = comment_metrics.get("_comment_timestamps", []) or []
+
+        if merged_llm.is_merged_mode():
+            logger.info("  [Step 5/6] Running merged LLM (Claude Sonnet 4.6)...")
+            merged_input_comments: list[dict] = []
+            for i, txt in enumerate(yt_comment_texts[:50]):
+                merged_input_comments.append(
+                    {
+                        "user": yt_commenter_handles[i]
+                        if i < len(yt_commenter_handles)
+                        else None,
+                        "text": txt,
+                        "timestamp": yt_comment_timestamps[i]
+                        if i < len(yt_comment_timestamps)
+                        else None,
+                    }
+                )
+            merged = merged_llm.evaluate_creator(
                 handle=creator_handle,
                 bio=profile.get("bio") or "",
                 category=profile.get("category") or "",
-                # YT "captions" = video descriptions (titles fall back when description empty).
-                captions=[
-                    v.get("description") or v.get("title") or ""
-                    for v in videos
-                ],
-            )
-        except Exception as e:  # noqa: BLE001
-            cip["caption_intelligence"] = {"_llm_failure": True, "error": str(e)}
-        try:
-            cip["transcript_intelligence"] = analyze_transcripts(
-                gemini_client, handle=creator_handle, transcripts=transcripts
-            )
-        except Exception as e:  # noqa: BLE001
-            cip["transcript_intelligence"] = {"_llm_failure": True, "error": str(e)}
-        try:
-            cip["audience_intelligence"] = analyze_comments(
-                gemini_client,
-                handle=creator_handle,
-                comment_texts=comment_metrics.get("_comment_texts", []),
-                comment_timestamps=comment_metrics.get("_comment_timestamps", []),
-                commenter_handles=comment_metrics.get("_commenter_handles", []),
+                captions=yt_captions,
+                transcripts=transcripts,
+                comments=merged_input_comments or None,
                 comment_hour_distribution=comment_metrics.get(
                     "comment_hour_distribution_utc", {}
                 ),
-                num_posts_with_comments=len(videos),
             )
-        except Exception as e:  # noqa: BLE001
-            cip["audience_intelligence"] = {"_llm_failure": True, "error": str(e)}
+            for key, payload in merged_llm.split_into_dimensions(merged).items():
+                cip[key] = payload
+        else:
+            logger.info("  [Step 5/6] Running Gemini analysis (legacy three-call)...")
+            gemini_client = init_gemini(gemini_api_key)
+            try:
+                cip["caption_intelligence"] = analyze_captions(
+                    gemini_client,
+                    handle=creator_handle,
+                    bio=profile.get("bio") or "",
+                    category=profile.get("category") or "",
+                    captions=yt_captions,
+                )
+            except Exception as e:  # noqa: BLE001
+                cip["caption_intelligence"] = {"_llm_failure": True, "error": str(e)}
+            try:
+                cip["transcript_intelligence"] = analyze_transcripts(
+                    gemini_client, handle=creator_handle, transcripts=transcripts
+                )
+            except Exception as e:  # noqa: BLE001
+                cip["transcript_intelligence"] = {"_llm_failure": True, "error": str(e)}
+            try:
+                cip["audience_intelligence"] = analyze_comments(
+                    gemini_client,
+                    handle=creator_handle,
+                    comment_texts=yt_comment_texts,
+                    comment_timestamps=yt_comment_timestamps,
+                    commenter_handles=yt_commenter_handles,
+                    comment_hour_distribution=comment_metrics.get(
+                        "comment_hour_distribution_utc", {}
+                    ),
+                    num_posts_with_comments=len(videos),
+                )
+            except Exception as e:  # noqa: BLE001
+                cip["audience_intelligence"] = {"_llm_failure": True, "error": str(e)}
+
+        # ── STEP 5b: Per-video analysis (LLM_PER_POST) ──
+        from pipeline import llm_post
+
+        if llm_post.is_per_post_mode():
+            logger.info("  [Step 5b] Running per-video analysis (OpenRouter)...")
+            payloads, item_meta = llm_post.run_per_post_analysis(
+                creator_handle,
+                "youtube",
+                posts=videos,
+                transcripts=transcripts,
+                comments_by_post=comment_metrics.get("_comments_by_post"),
+            )
+            cip["_post_payloads"] = payloads
+            cip["_post_item_meta"] = item_meta
+            logger.info(f"  [Step 5b] Analysed {len(payloads)} videos per-video")
 
         # ── STEP 6: scoring ──
         logger.info("  [Step 6/6] Computing YT CPI...")
@@ -957,23 +1131,19 @@ def _posts_per_week_from_cadence(cadence_days: float | None) -> float | None:
 
 def build_youtube_creator_intelligence_profile_batch(
     channel_urls: list[str],
-    brightdata_token: str,
     gemini_api_key: str,
     openai_api_key: str,
     youtube_api_key: str | None = None,
     num_videos: int = 20,
     num_transcripts: int = 5,
     max_workers: int = 8,
+    *,
+    on_complete=None,
 ) -> list[dict]:
     """Batch YT CIP builder for N creators.
 
-    Wins vs. looping the single-creator builder:
-    1. One Bright Data channel trigger for all URLs (instead of N).
-       Pricing is per-record returned, so the savings are wall-clock, not
-       dollars — one HTTP round-trip and one snapshot poll instead of N.
-    2. Per-creator stages 3–7 (video discovery, comments, transcripts,
-       Gemini, scoring) run in a ThreadPoolExecutor; these are I/O-bound
-       so threads are fine.
+    Per-creator stages run in a ThreadPoolExecutor — these are I/O-bound
+    against the YouTube Data API so threads are fine.
 
     Returns a list of CIPs in the SAME ORDER as input. Failed creators
     have `{'error': ...}` on their dict — same shape as the single-creator
@@ -981,22 +1151,25 @@ def build_youtube_creator_intelligence_profile_batch(
     """
     from concurrent.futures import ThreadPoolExecutor
     from pipeline.youtube.handle_resolver import resolve as resolve_yt
-    from pipeline.youtube.youtube_api import YouTubeAPIClient
-    from pipeline.youtube.scraper_channels import (
-        scrape_channels,
-        extract_channel_metrics,
-    )
+    from pipeline.youtube.api_pool import YouTubeAPIPool
+    from pipeline.youtube.scraper_channels import scrape_channels
 
     if not channel_urls:
         return []
 
     logger.info(f"Batch YT CIP build: {len(channel_urls)} creators")
-    bd_client = BrightdataClient(api_token=brightdata_token)
-    yt_api = YouTubeAPIClient(api_key=youtube_api_key)
+
+    # Multi-key API pool for stats, video discovery, comments. Required —
+    # the BrightData fallback was removed in the pipeline rewrite.
+    yt_pool = YouTubeAPIPool()
+    if not yt_pool.available:
+        raise RuntimeError(
+            "Batch YT pipeline requires at least one YT API key — set "
+            "YOUTUBE_API_KEYS (comma-separated) or YOUTUBE_API_KEY."
+        )
+    yt_api = yt_pool  # downstream methods are signature-compatible
 
     # ── Stage 1: resolve URLs in parallel ──
-    # Handle resolution hits the YT API (1 unit) per handle-form URL.
-    # Channel-ID-form URLs short-circuit without an API call.
     resolved_by_url: dict[str, object] = {}
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
         futures = {pool.submit(resolve_yt, u, yt_api): u for u in channel_urls}
@@ -1012,11 +1185,26 @@ def build_youtube_creator_intelligence_profile_batch(
         for u in channel_urls
     ]
 
-    # ── Stage 2: ONE Bright Data channel trigger for all URLs ──
-    # Up to ~500 URLs per trigger. Returns one record per URL (or an error
-    # record for bad URLs — we tolerate partial failures).
+    # ── Stage 2: channel records via YT API (batched 50/call inside the pool) ──
     try:
-        raw_channels = scrape_channels(bd_client, canonical_urls)
+        channel_ids = [
+            (resolved_by_url.get(u).channel_id if resolved_by_url.get(u) else None)
+            for u in channel_urls
+        ]
+        # Drop unresolved URLs from the API fetch; we still pass the
+        # original URL list to scrape_channels so output order matches input.
+        resolvable = [
+            (url, cid)
+            for url, cid in zip(channel_urls, channel_ids)
+            if cid
+        ]
+        if resolvable:
+            urls_for_api, ids_for_api = zip(*resolvable)
+            raw_channels = scrape_channels(
+                list(urls_for_api), yt_api=yt_pool, channel_ids=list(ids_for_api)
+            )
+        else:
+            raw_channels = []
     except Exception as e:  # noqa: BLE001
         logger.exception(f"Batch channel scrape failed: {e}")
         raw_channels = []
@@ -1049,7 +1237,6 @@ def build_youtube_creator_intelligence_profile_batch(
             canonical_url=canonical_url,
             resolved=resolved,
             raw_channel=raw_channel,
-            bd_client=bd_client,
             yt_api=yt_api,
             gemini_api_key=gemini_api_key,
             openai_api_key=openai_api_key,
@@ -1057,19 +1244,39 @@ def build_youtube_creator_intelligence_profile_batch(
             num_transcripts=num_transcripts,
         )
 
-    results: list[dict | None] = [None] * len(channel_urls)
+    # Stream results as workers finish (instead of blocking on futures[0]).
+    # `on_complete(cip)` fires immediately after each channel completes so
+    # callers can persist per-channel — important so a 6-hour batch isn't
+    # invisible until the slowest channel finishes.
+    from concurrent.futures import as_completed
+
+    completed = 0
+    total = len(channel_urls)
+    results: list[dict | None] = [None] * total
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {pool.submit(_one, i): i for i in range(len(channel_urls))}
-        for fut, i in futures.items():
+        futures = {pool.submit(_one, i): i for i in range(total)}
+        for fut in as_completed(futures):
+            i = futures[fut]
             try:
-                results[i] = fut.result()
+                cip = fut.result()
             except Exception as e:  # noqa: BLE001
                 logger.exception(f"Batch CIP build failed for index {i}")
-                results[i] = {
+                cip = {
                     "platform": "youtube",
                     "profile_url": channel_urls[i],
                     "error": str(e),
                 }
+            results[i] = cip
+            completed += 1
+            if on_complete is not None:
+                try:
+                    on_complete(cip)
+                except Exception as cb_err:  # noqa: BLE001
+                    logger.error(f"on_complete callback failed: {cb_err}")
+            if completed % 10 == 0 or completed == total:
+                logger.info(
+                    f"  YT batch progress: {completed}/{total} channels done"
+                )
 
     return [r for r in results if r is not None]
 
@@ -1080,7 +1287,6 @@ def _build_yt_cip_with_preloaded_channel(
     canonical_url: str,
     resolved,
     raw_channel: dict,
-    bd_client: BrightdataClient,
     yt_api,
     gemini_api_key: str,
     openai_api_key: str,
@@ -1091,8 +1297,7 @@ def _build_yt_cip_with_preloaded_channel(
 
     Factored out of `build_youtube_creator_intelligence_profile` so the
     batch orchestrator can run it concurrently per creator after a single
-    batched Bright Data channel scrape. Behavior must match the
-    single-creator path exactly for a batch-of-1.
+    batched channel fetch.
     """
     from pipeline.youtube.scraper_channels import extract_channel_metrics
     from pipeline.youtube.scraper_videos import (
@@ -1109,12 +1314,15 @@ def _build_yt_cip_with_preloaded_channel(
     from pipeline.youtube.transcripts import fetch_transcript
     from pipeline.confidence import YT_ER_BENCHMARKS
 
+    record_provenance = (raw_channel or {}).get(
+        "_data_provenance", "youtube_data_api_v3"
+    )
     cip: dict = {
         "platform": "youtube",
         "profile_url": original_url,
         "pipeline_version": PIPELINE_VERSION,
         "scraped_at": datetime.now().isoformat(),
-        "data_provenance": "brightdata_scraper_api+youtube_data_api_v3",
+        "data_provenance": record_provenance,
         "resolved": {
             "channel_id": getattr(resolved, "channel_id", None),
             "handle": getattr(resolved, "handle", None),
@@ -1162,7 +1370,6 @@ def _build_yt_cip_with_preloaded_channel(
 
         # Videos
         raw_videos = scrape_videos_discovery(
-            bd_client,
             canonical_url,
             num_videos,
             yt_api=yt_api,
@@ -1190,7 +1397,6 @@ def _build_yt_cip_with_preloaded_channel(
             tr = fetch_transcript(
                 video_id=vid,
                 video_url=vurl,
-                bd_client=bd_client,
                 openai_key=openai_api_key,
                 duration_seconds=v.get("duration_seconds"),
             )
@@ -1208,7 +1414,7 @@ def _build_yt_cip_with_preloaded_channel(
         # Comments + Gemini
         comment_video_urls = select_top_videos_for_comments(videos, top_n=5)
         raw_comments = (
-            scrape_yt_comments(bd_client, comment_video_urls, yt_api=yt_api)
+            scrape_yt_comments(comment_video_urls, yt_api=yt_api)
             if comment_video_urls else []
         )
         comment_metrics = extract_comment_metrics(
@@ -1218,41 +1424,89 @@ def _build_yt_cip_with_preloaded_channel(
         )
         cip["comments"] = comment_metrics
 
-        gemini_client = init_gemini(gemini_api_key)
+        from pipeline import llm as merged_llm
+
         creator_handle = profile.get("handle") or ""
-        try:
-            cip["caption_intelligence"] = analyze_captions(
-                gemini_client,
+        yt_captions = [
+            v.get("description") or v.get("title") or "" for v in videos
+        ]
+        yt_comment_texts = comment_metrics.get("_comment_texts", []) or []
+        yt_commenter_handles = comment_metrics.get("_commenter_handles", []) or []
+        yt_comment_timestamps = comment_metrics.get("_comment_timestamps", []) or []
+
+        if merged_llm.is_merged_mode():
+            merged_input_comments: list[dict] = []
+            for i, txt in enumerate(yt_comment_texts[:50]):
+                merged_input_comments.append(
+                    {
+                        "user": yt_commenter_handles[i]
+                        if i < len(yt_commenter_handles)
+                        else None,
+                        "text": txt,
+                        "timestamp": yt_comment_timestamps[i]
+                        if i < len(yt_comment_timestamps)
+                        else None,
+                    }
+                )
+            merged = merged_llm.evaluate_creator(
                 handle=creator_handle,
                 bio=profile.get("bio") or "",
                 category=profile.get("category") or "",
-                captions=[
-                    v.get("description") or v.get("title") or ""
-                    for v in videos
-                ],
-            )
-        except Exception as e:  # noqa: BLE001
-            cip["caption_intelligence"] = {"_llm_failure": True, "error": str(e)}
-        try:
-            cip["transcript_intelligence"] = analyze_transcripts(
-                gemini_client, handle=creator_handle, transcripts=transcripts
-            )
-        except Exception as e:  # noqa: BLE001
-            cip["transcript_intelligence"] = {"_llm_failure": True, "error": str(e)}
-        try:
-            cip["audience_intelligence"] = analyze_comments(
-                gemini_client,
-                handle=creator_handle,
-                comment_texts=comment_metrics.get("_comment_texts", []),
-                comment_timestamps=comment_metrics.get("_comment_timestamps", []),
-                commenter_handles=comment_metrics.get("_commenter_handles", []),
+                captions=yt_captions,
+                transcripts=transcripts,
+                comments=merged_input_comments or None,
                 comment_hour_distribution=comment_metrics.get(
                     "comment_hour_distribution_utc", {}
                 ),
-                num_posts_with_comments=len(videos),
             )
-        except Exception as e:  # noqa: BLE001
-            cip["audience_intelligence"] = {"_llm_failure": True, "error": str(e)}
+            for key, payload in merged_llm.split_into_dimensions(merged).items():
+                cip[key] = payload
+        else:
+            gemini_client = init_gemini(gemini_api_key)
+            try:
+                cip["caption_intelligence"] = analyze_captions(
+                    gemini_client,
+                    handle=creator_handle,
+                    bio=profile.get("bio") or "",
+                    category=profile.get("category") or "",
+                    captions=yt_captions,
+                )
+            except Exception as e:  # noqa: BLE001
+                cip["caption_intelligence"] = {"_llm_failure": True, "error": str(e)}
+            try:
+                cip["transcript_intelligence"] = analyze_transcripts(
+                    gemini_client, handle=creator_handle, transcripts=transcripts
+                )
+            except Exception as e:  # noqa: BLE001
+                cip["transcript_intelligence"] = {"_llm_failure": True, "error": str(e)}
+            try:
+                cip["audience_intelligence"] = analyze_comments(
+                    gemini_client,
+                    handle=creator_handle,
+                    comment_texts=yt_comment_texts,
+                    comment_timestamps=yt_comment_timestamps,
+                    commenter_handles=yt_commenter_handles,
+                    comment_hour_distribution=comment_metrics.get(
+                        "comment_hour_distribution_utc", {}
+                    ),
+                    num_posts_with_comments=len(videos),
+                )
+            except Exception as e:  # noqa: BLE001
+                cip["audience_intelligence"] = {"_llm_failure": True, "error": str(e)}
+
+        # ── Per-video analysis (LLM_PER_POST) ──
+        from pipeline import llm_post
+
+        if llm_post.is_per_post_mode():
+            payloads, item_meta = llm_post.run_per_post_analysis(
+                creator_handle,
+                "youtube",
+                posts=videos,
+                transcripts=transcripts,
+                comments_by_post=comment_metrics.get("_comments_by_post"),
+            )
+            cip["_post_payloads"] = payloads
+            cip["_post_item_meta"] = item_meta
 
         # Scoring
         llm_status = _summarize_llm_status(cip)

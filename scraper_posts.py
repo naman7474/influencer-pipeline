@@ -1,80 +1,84 @@
+"""Instagram posts scrape — Apify-backed."""
 import logging
+import os
 import re
 from collections import Counter
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from pipeline.brightdata_client import BrightdataClient
+from pipeline import apify_instagram_bundle
+from pipeline.apify_client import make_default_client
 
 logger = logging.getLogger(__name__)
 
-DATASET_POSTS = "gd_lk5ns7kz21pck8jpis"
-DATASET_REELS = "gd_lyclm20il4r5helnj"
+# Used by content video analysis (handlers.handle_content_video_analysis)
+# to grab a single post by URL. The bundle fetches by username; this
+# direct actor call is the right tool for one-off URL lookups.
+APIFY_ACTOR_POST = os.environ.get(
+    "APIFY_ACTOR_IG_POST", "apify/instagram-post-scraper"
+)
 
 
-def scrape_single_post(
-    client: BrightdataClient, post_url: str
-) -> dict | None:
+def scrape_single_post(post_url: str) -> dict | None:
+    """Scrape a single Instagram post/reel by URL via Apify.
+
+    Used by the content-submission analyzer to fetch video_url + metadata
+    for a creator-submitted reel. Returns a BD-shaped dict (the actor
+    output is translated to keep downstream consumers unchanged) or None
+    if Apify returned nothing.
     """
-    Scrape a single Instagram post/reel to get video_url and metadata.
-
-    Args:
-        client: Configured BrightdataClient
-        post_url: Full Instagram post/reel URL
-            e.g. https://www.instagram.com/reel/ABC123/
-
-    Returns:
-        Dict with video_url, description, likes, views, length etc.
-        None if scrape returned no results.
-    """
-    input_obj = {"url": post_url}
-    results = client.scrape_and_wait(DATASET_REELS, [input_obj])
-
-    if not results:
-        logger.warning(f"No data returned for post: {post_url}")
-        return None
-
-    post = results[0]
-    logger.info(
-        f"Scraped post {post.get('post_id', 'unknown')} — "
-        f"video_url={'yes' if post.get('video_url') else 'no'}"
+    client = make_default_client()
+    items = client.trigger_and_wait(
+        APIFY_ACTOR_POST, {"directUrls": [post_url], "resultsLimit": 1}
     )
-    return post
+    if not items:
+        logger.warning("No data returned for post: %s", post_url)
+        return None
+    return _translate_apify_post(items[0])
+
+
+def _translate_apify_post(item: dict) -> dict:
+    """Translate one apify/instagram-post-scraper item into the BD-shaped
+    fields downstream consumers (extract_post_metrics, content_analyzer)
+    expect.
+    """
+    return {
+        "post_id": item.get("id") or item.get("shortCode"),
+        "url": item.get("url"),
+        "description": item.get("caption") or "",
+        "likes": item.get("likesCount") or 0,
+        "num_comments": item.get("commentsCount") or 0,
+        "views": item.get("videoViewCount") or item.get("videoPlayCount") or 0,
+        "video_view_count": item.get("videoViewCount") or 0,
+        "video_play_count": item.get("videoPlayCount") or 0,
+        "length": item.get("videoDuration") or 0,
+        "video_url": item.get("videoUrl"),
+        "content_type": "Video" if item.get("type") == "Video" else item.get("type"),
+        "date_posted": item.get("timestamp"),
+        "hashtags": item.get("hashtags") or [],
+        "tagged_users": item.get("taggedUsers") or [],
+        "is_paid_partnership": item.get("isSponsored") or False,
+    }
 
 
 def scrape_posts_discovery(
-    client: BrightdataClient,
     profile_url: str,
-    num_posts: int = 20,
-    days_back: int = 90,
+    num_posts: int = 5,
+    days_back: int = 90,  # noqa: ARG001 — kept for signature stability; the
+                          # bundle applies its own recency window
 ) -> list[dict]:
-    """
-    Discover recent posts from a creator's profile.
+    """Discover recent posts from a creator's profile via the Apify bundle."""
+    username = _url_to_username(profile_url)
+    bundle = apify_instagram_bundle.fetch(username, num_posts=num_posts)
+    return bundle["posts"]
 
-    Uses the /scrape endpoint with type=discover_new&discover_by=url,
-    which returns rich per-post data from a single profile URL input.
 
-    Cost: 1 record per post returned = $0.03 for 20 posts at $1.50/1K
-    """
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=days_back)
-
-    input_obj = {
-        "url": profile_url,
-        "num_of_posts": num_posts,
-        "start_date": start_date.strftime("%m-%d-%Y"),
-        "end_date": end_date.strftime("%m-%d-%Y"),
-    }
-
-    extra_params = {
-        "type": "discover_new",
-        "discover_by": "url",
-    }
-
-    return client.scrape_and_wait(DATASET_POSTS, [input_obj], extra_params)
+def _url_to_username(url: str) -> str:
+    cleaned = url.rstrip("/")
+    return cleaned.rsplit("/", 1)[-1].lstrip("@")
 
 
 def _normalize_content_type(raw_type: str) -> str:
-    """Normalize BrightData content types to match DB enum values."""
+    """Normalize raw content types to match DB enum values."""
     mapping = {
         "Reel": "Video",
         "reel": "Video",
@@ -106,16 +110,9 @@ def extract_post_metrics(
     Compute all Tier A metrics from the posts array.
 
     Args:
-        posts: Raw post data from Brightdata
+        posts: Raw post data (BD-shaped, also what the Apify bundle emits)
         follower_count: From the profile scrape (denominator for engagement rate)
         handle: Creator's Instagram handle (to filter from brand mentions)
-
-    Returns:
-        Dict containing all Tier A computed metrics. When `follower_count`
-        is below the low-follower threshold (100), returns a stub with
-        `data_quality_flag='low_followers'` and `avg_engagement_rate=None`
-        so downstream scoring can skip ER math instead of producing a
-        spurious 0.0.
     """
     if not posts:
         return {}
@@ -148,7 +145,6 @@ def extract_post_metrics(
         comments = post.get("num_comments", 0) or 0
         ct = _normalize_content_type(post.get("content_type", "Image"))
 
-        # Engagement rate per post
         if follower_count > 0:
             er = (likes + comments) / follower_count
             engagement_rates.append(er)
@@ -156,29 +152,24 @@ def extract_post_metrics(
             if ct in engagement_by_type:
                 engagement_by_type[ct].append(er)
 
-        # Likes-to-comments ratio
         if comments > 0:
             likes_comments_ratios.append(likes / comments)
 
-        # Sponsored vs organic classification
         is_sponsored = _is_sponsored_post(post)
         if is_sponsored:
             sponsored_posts.append(post)
         else:
             organic_posts.append(post)
 
-        # Brand mentions from captions and tags (exclude creator's own handle)
         mentions = _extract_brand_mentions(post)
         if handle:
             mentions.discard(handle)
             mentions.discard(handle.lower())
         brand_mentions.update(mentions)
 
-        # Hashtags
         if post.get("hashtags"):
             all_hashtags.extend(post["hashtags"])
 
-        # Timestamps for frequency analysis
         if post.get("date_posted"):
             try:
                 dt = datetime.fromisoformat(
@@ -188,16 +179,13 @@ def extract_post_metrics(
             except (ValueError, TypeError):
                 pass
 
-    # Sort datetimes for trend and frequency analysis
     post_datetimes.sort()
 
-    # --- Posting Behaviour ---
     posting_gaps_days = []
     for i in range(1, len(post_datetimes)):
         gap = (post_datetimes[i] - post_datetimes[i - 1]).total_seconds() / 86400
         posting_gaps_days.append(gap)
 
-    # --- Content Mix ---
     type_counts = {}
     for post in posts:
         ct = _normalize_content_type(post.get("content_type", "Image"))
@@ -205,7 +193,6 @@ def extract_post_metrics(
     total_posts = len(posts)
     content_mix = {k: round(v / total_posts, 3) for k, v in type_counts.items()}
 
-    # --- Sponsored Analysis ---
     avg_sponsored_er = 0
     avg_organic_er = 0
     if sponsored_posts and follower_count > 0:
@@ -219,14 +206,11 @@ def extract_post_metrics(
             for p in organic_posts
         ) / len(organic_posts)
 
-    # --- Engagement Trend ---
     engagement_trend = _compute_engagement_trend(posts, follower_count)
 
-    # --- Peak Posting Times ---
     posting_hours = [dt.hour for dt in post_datetimes]
     peak_hours = _find_peak_hours(posting_hours)
 
-    # Posts per week: use total span, not average gap (resilient to outlier gaps)
     if len(post_datetimes) >= 2:
         span_days = (
             post_datetimes[-1] - post_datetimes[0]
@@ -237,7 +221,6 @@ def extract_post_metrics(
     else:
         posts_per_week = 0
 
-    # Posting consistency: sample stddev (Bessel's correction)
     consistency_stddev = 0
     if len(posting_gaps_days) >= 2:
         mean_gap = sum(posting_gaps_days) / len(posting_gaps_days)
@@ -247,7 +230,6 @@ def extract_post_metrics(
         consistency_stddev = round(variance**0.5, 2)
 
     return {
-        # Engagement
         "avg_engagement_rate": round(
             sum(engagement_rates) / max(len(engagement_rates), 1), 5
         ),
@@ -265,12 +247,10 @@ def extract_post_metrics(
             if v
         },
         "engagement_trend": engagement_trend,
-        # Posting Behaviour
         "posts_per_week": posts_per_week,
         "posting_consistency_stddev_days": consistency_stddev,
         "content_mix": content_mix,
         "peak_posting_hours": peak_hours,
-        # Brand Affinity
         "sponsored_post_rate": round(
             len(sponsored_posts) / max(total_posts, 1), 3
         ),
@@ -281,10 +261,8 @@ def extract_post_metrics(
         ),
         "brand_mentions": list(brand_mentions),
         "brand_mentions_count": len(brand_mentions),
-        # Hashtag Intelligence
         "top_hashtags": _top_n_items(all_hashtags, 20),
         "total_unique_hashtags": len(set(all_hashtags)),
-        # Raw data for downstream stages
         "_post_urls": [p.get("url") for p in posts if p.get("url")],
         "_reel_urls": [
             p.get("url")
@@ -317,7 +295,6 @@ def _is_sponsored_post(post: dict) -> bool:
     if any(tag in sponsored_tags for tag in hashtags):
         return True
 
-    # Use word-boundary regex to avoid false positives ("bad", "had a", etc.)
     sponsored_patterns = [
         r"\bpaid partnership\b",
         r"\b#ad\b",

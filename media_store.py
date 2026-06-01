@@ -65,12 +65,34 @@ def persist_media(
     if not source_url:
         return None
 
+    # IG/FB post-media CDN 403s plain server requests; a browser-ish UA + the
+    # Apify residential proxy (if configured) maximise the chance the download
+    # succeeds at scrape time (the only time these signed URLs are reachable).
+    import os
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Instagram"
+        ),
+        "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+    }
+    proxy = os.environ.get("MEDIA_DOWNLOAD_PROXY") or os.environ.get("YT_DLP_PROXY")
+    proxies = {"http": proxy, "https": proxy} if proxy else None
+
     try:
-        resp = requests.get(source_url, timeout=_DOWNLOAD_TIMEOUT)
+        resp = requests.get(
+            source_url, timeout=_DOWNLOAD_TIMEOUT, headers=headers, proxies=proxies
+        )
         resp.raise_for_status()
-    except Exception as e:
-        logger.warning(f"Failed to download media from {source_url}: {e}")
-        return None
+    except Exception:
+        # Retry once without the proxy (some CDNs reject proxied IPs).
+        try:
+            resp = requests.get(source_url, timeout=_DOWNLOAD_TIMEOUT, headers=headers)
+            resp.raise_for_status()
+        except Exception as e:
+            logger.warning(f"Failed to download media from {source_url}: {e}")
+            return None
 
     data = resp.content
     if not data:

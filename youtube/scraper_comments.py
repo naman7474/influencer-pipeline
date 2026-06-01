@@ -1,61 +1,28 @@
-"""YouTube comments fetch — API-primary (Phase 2.5), Bright Data fallback.
+"""YouTube comments fetch — YouTube Data API v3 only.
 
-Post-Phase-2.5, this module uses YouTube Data API's `commentThreads.list`
-as the primary source:
+Uses YouTube Data API's `commentThreads.list` as the sole source:
   - 1 quota unit per video (one call each, up to 100 threads per call)
-  - `order=relevance` mirrors Bright Data's "top comments" default
+  - `order=relevance` returns the top comments by default
   - No-OAuth read is allowed on public videos
-
-Falls back to Bright Data when the API is unavailable (no key, quota
-exhausted) or when YT_SCRAPER_PREFER_BRIGHTDATA=1.
-
-Comment records are normalized to the same shape regardless of source so
-`extract_comment_metrics` works unchanged.
 """
 
-import os
 from datetime import datetime
 
-from pipeline.brightdata_client import BrightdataClient
 from pipeline.youtube.youtube_api import YouTubeAPIClient
-
-DATASET_YT_COMMENTS = os.environ.get(
-    "BRIGHTDATA_DATASET_YT_COMMENTS", "gd_lk9q0ew71spt1mxywf"
-)
-
-
-def _prefer_bright_data() -> bool:
-    return os.environ.get("YT_SCRAPER_PREFER_BRIGHTDATA", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
 
 
 def scrape_comments(
-    bd_client: BrightdataClient,
     video_urls: list[str],
-    yt_api: YouTubeAPIClient | None = None,
+    *,
+    yt_api: YouTubeAPIClient,
 ) -> list[dict]:
-    """Fetch top comment threads for a batch of video URLs.
-
-    API path: one `commentThreads.list` call per video (1 unit each),
-    `order=relevance`, ~20 threads per video. Returns the flattened
-    union of all threads across all URLs — callers use
-    `extract_comment_metrics` on the aggregated list.
-
-    Bright Data fallback: one trigger with all URLs, up to ~20 threads
-    per URL. Same downstream shape.
-    """
-    use_api = (
-        not _prefer_bright_data()
-        and yt_api is not None
-        and yt_api.available
-    )
-    if use_api:
-        return _fetch_via_api(yt_api, video_urls)
-
-    return _fetch_via_bright_data(bd_client, video_urls)
+    """Fetch top comment threads for a batch of video URLs via the YT API."""
+    if not yt_api or not yt_api.available:
+        raise RuntimeError(
+            "scrape_comments requires a configured YouTubeAPIClient; "
+            "BrightData fallback was removed in the pipeline rewrite."
+        )
+    return _fetch_via_api(yt_api, video_urls)
 
 
 def _fetch_via_api(
@@ -71,6 +38,10 @@ def _fetch_via_api(
         # extract_comment_metrics expects Bright Data's field names; the
         # YouTubeAPIClient has already normalized to the same shape
         # (`author`, `author_channel_id`, `text`, `date`, `replies`).
+        # Tag each thread with its source video URL so we can group comments
+        # per-video for the per-post analysis path.
+        for t in threads:
+            t["_video_url"] = url
         out.extend(threads)
     return out
 
@@ -86,14 +57,6 @@ def _video_id_from_url(url: str) -> str | None:
     if "/shorts/" in url:
         return url.split("/shorts/", 1)[1].split("?", 1)[0].rstrip("/")
     return None
-
-
-def _fetch_via_bright_data(
-    client: BrightdataClient, video_urls: list[str]
-) -> list[dict]:
-    """Fallback path — original Bright Data flow."""
-    payload = [{"url": url} for url in video_urls]
-    return client.trigger_and_wait(DATASET_YT_COMMENTS, payload)
 
 
 def select_top_videos_for_comments(
@@ -129,6 +92,9 @@ def extract_comment_metrics(
     comment_texts: list[str] = []
     comment_timestamps: list[datetime] = []
     creator_replies = 0
+    # Per-video grouping for the per-post analysis path (keyed by video URL,
+    # matching how build_items joins comments to items). Mirrors the IG path.
+    comments_by_post: dict[str, list[dict]] = {}
 
     for comment in comments:
         author_id = comment.get("author_channel_id") or comment.get("channel_id")
@@ -141,6 +107,12 @@ def extract_comment_metrics(
             or comment.get("published_at")
             or comment.get("comment_date")
         )
+
+        vurl = (comment.get("_video_url") or "").rstrip("/")
+        if vurl:
+            comments_by_post.setdefault(vurl, []).append(
+                {"user": author_handle, "text": text, "timestamp": date_str}
+            )
 
         commenter_ids.append(author_id or author_handle)
         commenter_handles.append(author_handle)
@@ -173,6 +145,7 @@ def extract_comment_metrics(
         "_comment_texts": comment_texts,
         "_commenter_handles": commenter_handles,
         "_comment_timestamps": [dt.isoformat() for dt in comment_timestamps],
+        "_comments_by_post": comments_by_post,
         "comment_hour_distribution_utc": hour_distribution,
     }
 

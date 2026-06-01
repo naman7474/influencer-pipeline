@@ -1,23 +1,34 @@
+"""Instagram comments scrape — Apify-backed."""
+import logging
 from datetime import datetime
 
-from pipeline.brightdata_client import BrightdataClient
+from pipeline import apify_instagram_bundle
 
-DATASET_COMMENTS = "gd_ltppn085pokosxh13"
+logger = logging.getLogger(__name__)
 
 
-def scrape_comments(
-    client: BrightdataClient, post_urls: list[str]
-) -> list[dict]:
+def scrape_comments(post_urls: list[str]) -> list[dict]:
+    """Scrape comments for a batch of post URLs via the cached Apify bundle.
+
+    The bundle is keyed by username, so the comments come pre-scraped
+    when ``apify_instagram_bundle.fetch()`` ran for this creator. Here
+    we filter the cache down to the requested post URLs (or fall back
+    to the full set if filtering removes everything).
     """
-    Scrape recent comments from posts.
-
-    Each URL returns up to 10 most recent comments.
-    For 5 posts, that's ~50 comment records.
-
-    Cost: ~10 records per post URL = $0.075 for 5 posts at $1.50/1K
-    """
-    payload = [{"url": url} for url in post_urls]
-    return client.trigger_and_wait(DATASET_COMMENTS, payload)
+    if not post_urls:
+        return []
+    username = apify_instagram_bundle.any_cached_username()
+    if not username:
+        logger.warning("No cached bundle; pipeline must scrape profile first.")
+        return []
+    bundle = apify_instagram_bundle.get_cached(username) or {}
+    all_comments = bundle.get("comments") or []
+    wanted = {u.rstrip("/") for u in post_urls}
+    filtered = [
+        c for c in all_comments
+        if (c.get("post_url") or "").rstrip("/") in wanted
+    ]
+    return filtered or all_comments
 
 
 def select_top_posts_for_comments(
@@ -53,6 +64,11 @@ def extract_comment_metrics(
     comment_texts = []
     comment_timestamps = []
     creator_replies = 0
+    # Per-post grouping for the per-video analysis path (LLM_PER_POST). Keyed by
+    # normalised post_url so the orchestrator can give each post its own
+    # comments for comment-classification + audience-intent. The flattened
+    # fields below are preserved unchanged for the legacy creator-level path.
+    comments_by_post: dict[str, list[dict]] = {}
 
     for comment in comments:
         user = comment.get("comment_user") or comment.get("user_commenting", "")
@@ -62,16 +78,30 @@ def extract_comment_metrics(
         commenter_handles.append(user)
         comment_texts.append(text)
 
+        iso_ts = None
         if date_str:
             try:
                 dt = datetime.fromisoformat(
                     str(date_str).replace("Z", "+00:00")
                 )
                 comment_timestamps.append(dt)
+                iso_ts = dt.isoformat()
             except (ValueError, TypeError):
                 pass
 
-        # Check replies for creator engagement
+        post_url = (
+            comment.get("source_post_url")
+            or comment.get("post_url")
+            or comment.get("postUrl")
+            or comment.get("input_url")
+            or comment.get("inputUrl")
+            or ""
+        ).rstrip("/")
+        if post_url:
+            comments_by_post.setdefault(post_url, []).append(
+                {"user": user, "text": text, "timestamp": iso_ts}
+            )
+
         replies = comment.get("replies") or []
         for reply in replies:
             reply_user = (
@@ -94,19 +124,13 @@ def extract_comment_metrics(
         "_comment_texts": comment_texts,
         "_commenter_handles": commenter_handles,
         "_comment_timestamps": [dt.isoformat() for dt in comment_timestamps],
+        "_comments_by_post": comments_by_post,
         "comment_hour_distribution_utc": hour_distribution,
     }
 
 
 def _cluster_comment_hours(timestamps: list[datetime]) -> dict:
-    """
-    Cluster comment timestamps by UTC hour.
-
-    For Indian audiences:
-    - IST = UTC+5:30
-    - Peak evening hours in India (7-11 PM IST) = 13:30-17:30 UTC
-    - If most comments cluster in UTC 13-18, strong India signal
-    """
+    """Cluster comment timestamps by UTC hour."""
     if not timestamps:
         return {}
 

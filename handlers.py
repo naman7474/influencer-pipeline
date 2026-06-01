@@ -27,6 +27,7 @@ from pipeline.embeddings import (
 )
 from pipeline.pipeline import build_creator_intelligence_profile
 from pipeline.calibration import load_er_benchmarks
+from pipeline.instagram_apify_dm import handle_instagram_dm_send_apify
 
 logger = logging.getLogger(__name__)
 
@@ -374,15 +375,25 @@ def _update_brand(db, brand_id: str, patch: dict[str, Any]) -> None:
     db.table("brands").update(patch).eq("id", brand_id).execute()
 
 
-def _update_creator_embedding(
-    db, creator_id: str, embedding: list[float]
-) -> None:
-    db.table("creators").update(
-        {
-            "content_embedding": embedding,
-            "embedding_computed_at": datetime.now(timezone.utc).isoformat(),
-        }
-    ).eq("id", creator_id).execute()
+def _upsert_synthetic_geo_rows(db, brand_id: str, rows: list[dict]) -> int:
+    """
+    Replace this brand's source='synthetic' rows in brand_shopify_geo with
+    a fresh set. Real (source='shopify') rows are left untouched. The
+    UNIQUE index from migration 20260502_brand_synthetic_geo lets the two
+    sources coexist per (brand, city, state).
+
+    Implemented as delete-then-insert rather than upsert because the
+    underlying unique index is over lower(coalesce(city,'')) etc. — an
+    expression index that PostgREST can't infer from `on_conflict` column
+    names.
+    """
+    if not rows:
+        return 0
+    db.table("brand_shopify_geo").delete().eq("brand_id", brand_id).eq(
+        "source", "synthetic"
+    ).execute()
+    db.table("brand_shopify_geo").insert(rows).execute()
+    return len(rows)
 
 
 def _siblings_all_terminal(db, brand_id: str) -> bool:
@@ -399,47 +410,53 @@ def _siblings_all_terminal(db, brand_id: str) -> bool:
     return all(r["status"] in ("succeeded", "failed") for r in rows)
 
 
-def _trigger_matching_compute(brand_id: str) -> None:
-    """Fire-and-forget call to /api/matching/compute. Failure is non-fatal —
-    a scheduled re-compute will catch up."""
-    base = os.environ.get("WEB_APP_URL")
-    secret = os.environ.get("MATCHING_COMPUTE_SECRET")
-    if not base:
-        logger.warning("WEB_APP_URL not set; skipping matching recompute trigger")
-        return
-    try:
-        headers = {"Content-Type": "application/json"}
-        if secret:
-            headers["X-Worker-Secret"] = secret
-        url = f"{base.rstrip('/')}/api/matching/compute"
-        with httpx.Client(timeout=10.0) as client:
-            client.post(url, json={"brand_id": brand_id}, headers=headers)
-        logger.info(f"Triggered matching recompute for brand {brand_id}")
-    except Exception as e:
-        logger.warning(f"Failed to trigger matching recompute: {e}")
-
-
-def _trigger_creator_recompute(creator_id: str) -> None:
-    """Fire-and-forget call to /api/matching/recompute-creator for
-    standalone creator pipeline runs (no parent brand fanout)."""
-    base = os.environ.get("WEB_APP_URL")
-    secret = os.environ.get("MATCHING_COMPUTE_SECRET")
-    if not base or not secret:
-        logger.warning(
-            "WEB_APP_URL or MATCHING_COMPUTE_SECRET not set; skipping creator recompute"
+def _trigger_matching_compute(brand_id: str, db=None) -> None:
+    """In-process matching recompute for a brand. Calls into
+    :mod:`pipeline.match`, which prefers the TS engine and falls back to
+    the Python embedding-only baseline. Failures are LOUD: logged with
+    full context, but still non-fatal to the parent job (a brand fanout
+    completing shouldn't roll back because matching glitched)."""
+    if db is None:
+        from pipeline import db as pdb_mod
+        db = pdb_mod.init_supabase(
+            os.environ["SUPABASE_URL"],
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
         )
-        return
+    from pipeline import match
+
     try:
-        headers = {
-            "Content-Type": "application/json",
-            "X-Worker-Secret": secret,
-        }
-        url = f"{base.rstrip('/')}/api/matching/recompute-creator"
-        with httpx.Client(timeout=10.0) as client:
-            client.post(url, json={"creator_id": creator_id}, headers=headers)
-        logger.info(f"Triggered creator recompute for creator {creator_id}")
-    except Exception as e:
-        logger.warning(f"Failed to trigger creator recompute: {e}")
+        result = match.recompute_for_brand(db, brand_id)
+        logger.info(
+            "Matching recompute for brand %s: source=%s body=%s",
+            brand_id, result.get("source"), str(result)[:200],
+        )
+    except match.MatchingError as e:
+        logger.error(
+            "Matching recompute FAILED for brand %s: %s", brand_id, e
+        )
+
+
+def _trigger_creator_recompute(creator_id: str, db=None) -> None:
+    """In-process matching recompute for a single creator across all
+    brands. Same TS-then-baseline strategy as the brand path."""
+    if db is None:
+        from pipeline import db as pdb_mod
+        db = pdb_mod.init_supabase(
+            os.environ["SUPABASE_URL"],
+            os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+        )
+    from pipeline import match
+
+    try:
+        result = match.recompute_for_creator(db, creator_id)
+        logger.info(
+            "Matching recompute for creator %s: source=%s",
+            creator_id, result.get("source"),
+        )
+    except match.MatchingError as e:
+        logger.error(
+            "Matching recompute FAILED for creator %s: %s", creator_id, e
+        )
 
 
 # ── Handlers ────────────────────────────────────────────────────────────────
@@ -464,13 +481,11 @@ def handle_brand_ig_scrape(db, job: dict) -> None:
         },
     )
 
-    brightdata_token = _require_env("BRIGHTDATA_API_TOKEN")
     gemini_key = _require_env("GEMINI_API_KEY")
     openai_key = _require_env("OPENAI_API_KEY")
 
     cip = build_creator_intelligence_profile(
         profile_url=_handle_url(handle),
-        brightdata_token=brightdata_token,
         gemini_api_key=gemini_key,
         openai_api_key=openai_key,
         er_benchmarks=load_er_benchmarks(db),
@@ -486,6 +501,23 @@ def handle_brand_ig_scrape(db, job: dict) -> None:
     ig_cohort = _extract_collaborators_from_posts(raw_posts, handle)
     all_collaborators = _union_past_collaborations(
         ig_cohort, brand.get("past_collaborations"), handle
+    )
+
+    # Brand niche classification — aligns brand vocabulary with creator
+    # caption_intelligence.primary_niche so the matcher's computeNicheFit
+    # compares apples to apples (see web/src/lib/matching/types.ts NICHE_ENUM).
+    from pipeline.llm_brand_niche import classify_brand_niche
+    from pipeline.llm_client import init_gemini
+
+    niche_result = classify_brand_niche(
+        init_gemini(gemini_key),
+        brand_name=brand.get("brand_name"),
+        industry=brand.get("industry"),
+        product_categories=brand.get("product_categories"),
+        target_audience=brand.get("target_audience"),
+        description=brand.get("brand_description"),
+        ig_content_dna=ig_content_dna,
+        shopify_connected=brand.get("shopify_connected"),
     )
 
     # Generate brand embedding
@@ -512,7 +544,72 @@ def handle_brand_ig_scrape(db, job: dict) -> None:
     if embedding is not None:
         patch["content_embedding"] = embedding
         patch["embedding_computed_at"] = now_iso
+    if niche_result.get("primary_niche"):
+        patch["primary_niche"] = niche_result["primary_niche"]
+        patch["secondary_niche"] = niche_result.get("secondary_niche")
+        patch["niche_classified_at"] = now_iso
+    if niche_result.get("brand_type"):
+        patch["brand_type"] = niche_result["brand_type"]
     _update_brand(db, brand_id, patch)
+
+    # Also write the platform analysis row used by the matching engine.
+    # Without this, brand_platform_analyses.content_dna stays {} forever
+    # (the YT handler does this; IG was missing the call) — kills
+    # theme_overlap_bonus + competitor_bonus + Fix #2 graded niche fit.
+    ig_analysis = {
+        "handle": handle,
+        "profile_url": _handle_url(handle),
+        "analysis_status": "completed",
+        "analysis_completed_at": now_iso,
+        "analysis_error": None,
+        "content_dna": cip.get("caption_intelligence"),
+        "audience_profile": cip.get("audience_intelligence"),
+        "collaborators": all_collaborators,
+    }
+    if embedding is not None:
+        ig_analysis["content_embedding"] = embedding
+        ig_analysis["embedding_computed_at"] = now_iso
+    pdb.upsert_brand_platform_analysis(db, brand_id, "instagram", ig_analysis)
+
+    # Persist the brand's OWN per-video content (transcripts + per-post
+    # intelligence + content distributions) so we can analyse what content
+    # works for the brand. No-op unless per-video analysis ran (LLM_PER_POST).
+    try:
+        pdb.store_brand_post_content(db, brand_id, "instagram", cip)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("store_brand_post_content failed for brand %s: %s", brand_id, e)
+
+    # Brand affinity from the SAME scrape (commenters on the brand's posts +
+    # creators the brand tags + caption mentions) — no second Apify scrape.
+    try:
+        affinity_posts = (cip.get("_raw_posts") or []) + (cip.get("_raw_reels") or [])
+        _harvest_affinity(
+            db, brand_id, handle, (brand.get("brand_name") or "").strip(),
+            _commenter_entries_from_cip(cip), affinity_posts,
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("affinity harvest in brand_ig_scrape failed for %s: %s", brand_id, e)
+
+    # Synthetic geo for non-Shopify brands. Without this the matching
+    # engine's audience_geo floors at 0.3 (engine.ts:1167), capping the
+    # composite at 35-45%. Real Shopify rows take precedence in
+    # v_brand_geo_gaps so connecting Shopify later overrides this.
+    if not brand.get("shopify_connected"):
+        from pipeline.geo_synthesis import derive_synthetic_geo_rows
+
+        synth_rows = derive_synthetic_geo_rows(
+            brand_id=brand_id,
+            shipping_zones=brand.get("shipping_zones"),
+            target_regions=brand.get("target_regions"),
+            ig_audience_profile=ig_audience_profile,
+        )
+        try:
+            n = _upsert_synthetic_geo_rows(db, brand_id, synth_rows)
+            logger.info(f"Brand {brand_id}: upserted {n} synthetic geo rows")
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Synthetic geo upsert failed for brand {brand_id}: {e}"
+            )
 
     # Fan-out: cap at MAX_FANOUT_CREATORS, skip fresh ones
     fresh = _get_fresh_creator_handles(db, all_collaborators)
@@ -525,27 +622,35 @@ def handle_brand_ig_scrape(db, job: dict) -> None:
 
     # Edge case: no fanout → trigger matching compute now
     if enqueued == 0:
-        _trigger_matching_compute(brand_id)
+        _trigger_matching_compute(brand_id, db=db)
 
 
 def handle_creator_ig_scrape(db, job: dict) -> None:
+    """Entry point for creator_ig_scrape jobs.
+
+    In webhook mode (``APIFY_WEBHOOKS=1``) this kicks off the first Apify
+    run and raises :class:`ig.JobPaused` — the actual finalize work
+    happens later when the webhook fires (or the recovery sweep runs).
+
+    In legacy sync mode it scrapes + finalizes inline.
+    """
     payload = job.get("payload") or {}
     handle = payload.get("handle")
-    parent_brand_id = payload.get("parent_brand_id") or job.get("brand_id")
-    # Phase 2.5 auto-stitch: when a YT scrape discovered this creator's
-    # IG handle in external_links, it enqueues this job with the existing
-    # creators.id so the IG profile attaches onto the same row.
-    existing_creator_id = payload.get("existing_creator_id")
     if not handle:
         raise ValueError("creator_ig_scrape job missing handle in payload")
 
-    brightdata_token = _require_env("BRIGHTDATA_API_TOKEN")
+    from pipeline import ig
+
+    if ig.is_webhook_mode():
+        # Kicks off Apify run 1; raises JobPaused to the worker.
+        ig.start_scrape(db, job)
+        return  # unreachable — start_scrape always raises JobPaused
+
+    # Legacy synchronous path — drains in this call.
     gemini_key = _require_env("GEMINI_API_KEY")
     openai_key = _require_env("OPENAI_API_KEY")
-
     cip = build_creator_intelligence_profile(
         profile_url=_handle_url(handle),
-        brightdata_token=brightdata_token,
         gemini_api_key=gemini_key,
         openai_api_key=openai_key,
         er_benchmarks=load_er_benchmarks(db),
@@ -553,34 +658,97 @@ def handle_creator_ig_scrape(db, job: dict) -> None:
     if cip.get("error"):
         raise RuntimeError(f"CIP failed for creator @{handle}: {cip['error']}")
 
-    creator_id = pdb.store_full_cip(db, cip, existing_creator_id=existing_creator_id)
+    _finalize_creator_ig_scrape(db, job, cip=cip)
+
+
+def _finalize_creator_ig_scrape(db, job: dict, *, cip: dict | None = None) -> None:
+    """Persist a CIP and run all side-effects (embed, auto-stitch, matching).
+
+    Shared by the legacy sync handler and the webhook-driven FSM. When
+    ``cip`` is not provided, this function recomputes it via
+    :func:`build_creator_intelligence_profile`; the FSM pre-populates
+    the bundle cache so that call hits the cache and skips Apify.
+    """
+    payload = job.get("payload") or {}
+    handle = payload.get("handle")
+    parent_brand_id = payload.get("parent_brand_id") or job.get("brand_id")
+    existing_creator_id = payload.get("existing_creator_id")
+    source = payload.get("source")
+    inbound_creator_id = payload.get("inbound_creator_id")
+
+    if cip is None:
+        gemini_key = _require_env("GEMINI_API_KEY")
+        openai_key = _require_env("OPENAI_API_KEY")
+        cip = build_creator_intelligence_profile(
+            profile_url=_handle_url(handle),
+            gemini_api_key=gemini_key,
+            openai_api_key=openai_key,
+            er_benchmarks=load_er_benchmarks(db),
+        )
+        if cip.get("error"):
+            raise RuntimeError(
+                f"CIP failed for creator @{handle}: {cip['error']}"
+            )
+
+    creator_id = pdb.store_full_cip(
+        db, cip, existing_creator_id=existing_creator_id
+    )
+
+    if source and creator_id:
+        update = {"source": source}
+        if parent_brand_id:
+            update["source_brand_id"] = parent_brand_id
+        if inbound_creator_id:
+            update["source_inbound_id"] = inbound_creator_id
+        try:
+            db.table("creators").update(update).eq("id", creator_id).execute()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"creator source attribution failed for {creator_id}: {e}"
+            )
+
+    if inbound_creator_id and creator_id:
+        try:
+            db.table("inbound_creators").update(
+                {"linked_creator_id": creator_id, "status": "scored"}
+            ).eq("id", inbound_creator_id).execute()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"inbound_creators link failed for {inbound_creator_id}: {e}"
+            )
 
     embedding_input = build_creator_embedding_input(cip)
     if embedding_input:
-        embedding = embed_text(embedding_input, openai_key)
-        # Shadow column (creators.content_embedding) for one release.
-        _update_creator_embedding(db, creator_id, embedding)
-        # Per-platform embedding (migration 046) — canonical going forward.
+        embedding = embed_text(embedding_input, _require_env("OPENAI_API_KEY"))
         pdb.upsert_creator_platform_embedding(
-            db, creator_id, "instagram", embedding
+            db, creator_id, "instagram", embedding,
+            content_text=embedding_input,
         )
 
-    # Auto-stitch: discover YT handle in IG's external_url, fan out a YT
-    # scrape bound to the same creator row. Skips if creator already has
-    # a YT profile (loop prevention for YT->IG->YT round-trip).
     try:
         _run_auto_stitch_from_ig(db, creator_id, cip)
     except Exception as e:  # noqa: BLE001
         logger.warning(f"IG auto-stitch failed for creator {creator_id}: {e}")
 
-    # If this creator was part of a brand fanout, trigger a brand-scoped
-    # recompute when the whole fanout is done. Otherwise (standalone
-    # creator run) trigger a per-creator recompute so any brand with
-    # Shopify data picks up the new score.
+    # Async transcripts: when the pipeline deferred transcription
+    # (WHISPER_ASYNC=1), fan out background jobs that will fill in
+    # transcripts off the critical path and trigger an audience_refresh.
+    pending = cip.get("_async_transcribe_pending") or []
+    if pending and creator_id:
+        from pipeline import whisper_client
+
+        whisper_client.enqueue_transcribe_async_jobs(
+            db,
+            creator_id=creator_id,
+            brand_id=parent_brand_id,
+            items=pending,
+            source="instagram",
+        )
+
     if parent_brand_id and _siblings_all_terminal(db, parent_brand_id):
-        _trigger_matching_compute(parent_brand_id)
+        _trigger_matching_compute(parent_brand_id, db=db)
     elif not parent_brand_id and creator_id:
-        _trigger_creator_recompute(creator_id)
+        _trigger_creator_recompute(creator_id, db=db)
 
 
 # ── Content Video Analysis ─────────────────────────────────────────────────
@@ -593,7 +761,6 @@ def handle_content_video_analysis(db, job: dict) -> None:
     Pipeline: fetch context → scrape video URL → transcribe (Whisper) →
     analyze (Claude) → store results.
     """
-    from pipeline.brightdata_client import BrightdataClient
     from pipeline.content_analyzer import (
         ANALYSIS_VERSION,
         MODEL as ANALYSIS_MODEL,
@@ -687,11 +854,9 @@ def handle_content_video_analysis(db, job: dict) -> None:
 
     if has_video:
         try:
-            brightdata_token = _require_env("BRIGHTDATA_API_TOKEN")
             openai_key = _require_env("OPENAI_API_KEY")
 
-            bd_client = BrightdataClient(api_token=brightdata_token)
-            post_data = scrape_single_post(bd_client, content_url)
+            post_data = scrape_single_post(content_url)
 
             if not post_data or not post_data.get("video_url"):
                 logger.warning(f"No video_url found for {content_url}")
@@ -818,7 +983,6 @@ def handle_creator_yt_scrape(db, job: dict) -> None:
 
     cip = build_youtube_creator_intelligence_profile(
         channel_url=channel_url,
-        brightdata_token=_require_env("BRIGHTDATA_API_TOKEN"),
         gemini_api_key=_require_env("GEMINI_API_KEY"),
         openai_api_key=_require_env("OPENAI_API_KEY"),
         youtube_api_key=os.environ.get("YOUTUBE_API_KEY"),
@@ -835,10 +999,9 @@ def handle_creator_yt_scrape(db, job: dict) -> None:
     embedding_input = build_creator_embedding_input(cip)
     if embedding_input:
         embedding = embed_text(embedding_input, _require_env("OPENAI_API_KEY"))
-        # Per-platform embedding for scoring (migration 046). No shadow
-        # column write for YT — that field is IG-indexed.
         pdb.upsert_creator_platform_embedding(
-            db, creator_id, "youtube", embedding
+            db, creator_id, "youtube", embedding,
+            content_text=embedding_input,
         )
 
     # Auto-stitch: inspect YT external_links for IG URL, fan out an IG
@@ -848,10 +1011,23 @@ def handle_creator_yt_scrape(db, job: dict) -> None:
     except Exception as e:  # noqa: BLE001
         logger.warning(f"YT auto-stitch failed for creator {creator_id}: {e}")
 
+    # Async transcripts: same fanout pattern as IG.
+    pending = cip.get("_async_transcribe_pending") or []
+    if pending and creator_id:
+        from pipeline import whisper_client
+
+        whisper_client.enqueue_transcribe_async_jobs(
+            db,
+            creator_id=creator_id,
+            brand_id=parent_brand_id,
+            items=pending,
+            source="youtube",
+        )
+
     if parent_brand_id and _siblings_all_terminal(db, parent_brand_id):
-        _trigger_matching_compute(parent_brand_id)
+        _trigger_matching_compute(parent_brand_id, db=db)
     elif not parent_brand_id and creator_id:
-        _trigger_creator_recompute(creator_id)
+        _trigger_creator_recompute(creator_id, db=db)
 
 
 def handle_brand_yt_scrape(db, job: dict) -> None:
@@ -879,7 +1055,6 @@ def handle_brand_yt_scrape(db, job: dict) -> None:
     resolved = resolve_yt(raw)
     cip = build_youtube_creator_intelligence_profile(
         channel_url=resolved.url,
-        brightdata_token=_require_env("BRIGHTDATA_API_TOKEN"),
         gemini_api_key=_require_env("GEMINI_API_KEY"),
         openai_api_key=_require_env("OPENAI_API_KEY"),
         youtube_api_key=os.environ.get("YOUTUBE_API_KEY"),
@@ -897,16 +1072,41 @@ def handle_brand_yt_scrape(db, job: dict) -> None:
     )
     collaborator_handles = [c["handle"] for c in collab_report["handles"]]
 
+    # Build brand embedding from YT caption_intelligence so the matching
+    # engine has a YT-side vector to compare against creator_embeddings.
+    now_iso = datetime.now(timezone.utc).isoformat()
+    yt_embedding: list[float] | None = None
+    if not cip.get("error"):
+        embedding_input = build_brand_embedding_input(
+            brand_name=(cip.get("profile") or {}).get("display_name"),
+            description=(cip.get("profile") or {}).get("bio"),
+            industry=None,
+            brand_values=None,
+            product_categories=None,
+            target_audience=None,
+            ig_content_dna=cip.get("caption_intelligence"),
+        )
+        if embedding_input:
+            try:
+                yt_embedding = embed_text(
+                    embedding_input, _require_env("OPENAI_API_KEY")
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"YT brand embedding failed for {brand_id}: {e}")
+
     analysis = {
         "handle": (cip.get("profile") or {}).get("handle"),
         "profile_url": resolved.url,
         "analysis_status": "failed" if cip.get("error") else "completed",
-        "analysis_completed_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_completed_at": now_iso,
         "analysis_error": cip.get("error"),
         "content_dna": cip.get("caption_intelligence"),
         "audience_profile": cip.get("audience_intelligence"),
         "collaborators": collaborator_handles,
     }
+    if yt_embedding is not None:
+        analysis["content_embedding"] = yt_embedding
+        analysis["embedding_computed_at"] = now_iso
     pdb.upsert_brand_platform_analysis(db, brand_id, "youtube", analysis)
 
 
@@ -991,16 +1191,345 @@ def handle_creator_multi_platform_scrape(db, job: dict) -> None:
 
     # Only trigger matching once, after both children finish.
     if parent_brand_id and _siblings_all_terminal(db, parent_brand_id):
-        _trigger_matching_compute(parent_brand_id)
+        _trigger_matching_compute(parent_brand_id, db=db)
+
+
+def handle_transcribe_async(db, job: dict) -> None:
+    """Call Modal Whisper on a single audio URL; persist the result on
+    the job row. When this is the last sibling in a ``group_id``, enqueue
+    an ``audience_refresh`` job that re-runs LLM eval with the now-complete
+    transcripts.
+    """
+    from pipeline import whisper_client
+
+    payload = job.get("payload") or {}
+    audio_url = payload.get("audio_url")
+    if not audio_url:
+        raise ValueError("transcribe_async job missing audio_url")
+
+    result = whisper_client.transcribe_sync(audio_url)
+    if not result:
+        # Fail soft: write an empty marker so audience_refresh proceeds
+        # with whatever transcripts we did get.
+        result = {"text": "", "error": "modal whisper unavailable"}
+
+    payload["_result"] = {
+        "text": result.get("text", ""),
+        "language": result.get("language"),
+        "avg_confidence": result.get("avg_confidence"),
+        "segments": result.get("segments") or [],
+    }
+    pdb.update_background_job_payload(db, job["id"], payload)
+
+    group_id = payload.get("group_id")
+    creator_id = payload.get("creator_id")
+    if not group_id or not creator_id:
+        return
+
+    # Check sibling status: did the LAST job in this group just finish?
+    siblings = (
+        db.table("background_jobs")
+        .select("id, status, payload")
+        .eq("job_type", "transcribe_async")
+        .execute()
+    )
+    same_group = [
+        r for r in (siblings.data or [])
+        if ((r.get("payload") or {}).get("group_id") == group_id)
+    ]
+    # This job is mid-handler so its status is still "running" — count it
+    # as done by id-match instead.
+    pending = [
+        r for r in same_group
+        if r["id"] != job["id"] and r["status"] not in {"succeeded", "failed"}
+    ]
+    if pending:
+        return
+
+    # Last sibling — enqueue the refresh.
+    refresh_payload = {
+        "creator_id": creator_id,
+        "source": payload.get("source"),
+        "group_id": group_id,
+    }
+    db.table("background_jobs").insert(
+        {
+            "job_type": "audience_refresh",
+            "brand_id": job.get("brand_id"),
+            "status": "queued",
+            "payload": refresh_payload,
+        }
+    ).execute()
+    logger.info(
+        "transcribe_async group %s complete; enqueued audience_refresh for creator %s",
+        group_id, creator_id,
+    )
+
+
+def handle_audience_refresh(db, job: dict) -> None:
+    """Re-run LLM transcript + audience analysis with the async-fetched
+    transcripts and write back to ``transcript_intelligence``.
+
+    Reads sibling ``transcribe_async`` rows in the same group, rebuilds
+    a transcripts list, and calls either the merged Sonnet LLM (when
+    ``LLM_MERGED=1``) or the legacy ``analyze_transcripts`` Gemini call.
+    """
+    from pipeline import llm as merged_llm
+
+    payload = job.get("payload") or {}
+    creator_id = payload.get("creator_id")
+    group_id = payload.get("group_id")
+    if not creator_id or not group_id:
+        raise ValueError("audience_refresh missing creator_id or group_id")
+
+    siblings = (
+        db.table("background_jobs")
+        .select("payload")
+        .eq("job_type", "transcribe_async")
+        .execute()
+    )
+    transcripts: list[dict] = []
+    for r in (siblings.data or []):
+        spl = r.get("payload") or {}
+        if spl.get("group_id") != group_id:
+            continue
+        result = spl.get("_result") or {}
+        if not result.get("text"):
+            continue
+        transcripts.append(
+            {
+                "post_id": spl.get("post_id"),
+                "transcript_text": result["text"],
+                "detected_language": result.get("language"),
+                "avg_confidence": result.get("avg_confidence", 0.0),
+                "caption_source": "whisper_modal",
+            }
+        )
+
+    if not transcripts:
+        logger.info(
+            "audience_refresh group=%s: no transcripts to fold in; skipping",
+            group_id,
+        )
+        return
+
+    creator_row = (
+        db.table("creators")
+        .select("handle")
+        .eq("id", creator_id)
+        .limit(1)
+        .execute()
+    )
+    handle = (creator_row.data or [{}])[0].get("handle") or ""
+
+    if merged_llm.is_merged_mode():
+        merged = merged_llm.evaluate_creator(
+            handle=handle,
+            bio=None,
+            category=None,
+            captions=None,
+            transcripts=transcripts,
+            comments=None,
+        )
+        dims = merged_llm.split_into_dimensions(merged)
+        ti = dims.get("transcript_intelligence") or {
+            "_llm_failure": True, "error": "no transcript dimension in merged output"
+        }
+    else:
+        from pipeline.llm_client import init_gemini
+        from pipeline.llm_transcripts import analyze_transcripts
+
+        gemini_client = init_gemini(_require_env("GEMINI_API_KEY"))
+        try:
+            ti = analyze_transcripts(
+                gemini_client, handle=handle, transcripts=transcripts
+            )
+        except Exception as e:  # noqa: BLE001
+            ti = {"_llm_failure": True, "error": str(e)}
+
+    pdb.insert_transcript_intelligence(db, creator_id, ti)
+    logger.info(
+        "audience_refresh: refreshed transcript intelligence for creator %s (%d transcripts)",
+        creator_id, len(transcripts),
+    )
+
+
+def _brand_tagged_handles(posts: list[dict], brand_handle: str) -> list[str]:
+    """All creators the brand tags / co-authors in its OWN posts (normalised,
+    deduped, minus the brand itself)."""
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in posts:
+        for src in (p.get("tagged_users") or [], p.get("coauthor_producers") or []):
+            for t in src:
+                u = t.get("username") if isinstance(t, dict) else t
+                if not u:
+                    continue
+                n = str(u).strip().lstrip("@").lower()
+                if n and n != brand_handle and n not in seen:
+                    seen.add(n)
+                    out.append(n)
+    return out
+
+
+def _affinity_edge(
+    brand_id: str,
+    creator_id: str,
+    signal_type: str,
+    *,
+    match_basis: str,
+    evidence: dict,
+    direction: str = "creator_to_brand",
+    observed_at=None,
+) -> dict:
+    rel = pdb.AFFINITY_RELIABILITY.get(signal_type, 0.5)
+    factor = 1.0 if match_basis == "id" else 0.85
+    return {
+        "brand_id": brand_id,
+        "creator_id": creator_id,
+        "platform": "instagram",
+        "signal_type": signal_type,
+        "direction": direction,
+        "confidence": round(rel * factor, 3),
+        "evidence": evidence,
+        "evidence_status": "observed",
+        "match_basis": match_basis,
+        "observed_at": observed_at,
+    }
+
+
+def _commenter_entries_from_cip(cip: dict) -> list[dict]:
+    """Normalise a CIP's comments into [{handle,text,post_url,observed_at}] for
+    affinity harvesting (used when brand_ig_scrape already scraped the brand)."""
+    cbp = (cip.get("comments") or {}).get("_comments_by_post") or {}
+    out: list[dict] = []
+    for url, cs in cbp.items():
+        for c in cs:
+            out.append({
+                "handle": c.get("user"), "text": c.get("text"),
+                "post_url": url, "observed_at": c.get("timestamp"),
+            })
+    return out
+
+
+def _harvest_affinity(
+    db, brand_id: str, brand_handle: str, brand_name: str,
+    commenter_entries: list[dict], posts: list[dict],
+) -> dict:
+    """Shared affinity matcher: commenters (engages) + brand-tagged creators +
+    caption mentions → edges + rollups. Used by both the standalone harvest and
+    brand_ig_scrape (which feeds it the already-scraped CIP data)."""
+    bh = brand_handle.lower().lstrip("@")
+    roster: list[dict] = []
+    edges: list[dict] = []
+    affected: set[str] = set()
+    seen: set[str] = set()
+
+    for e in commenter_entries:
+        u = (e.get("handle") or "").strip().lstrip("@").lower()
+        if not u or u == bh or u in seen:
+            continue
+        seen.add(u)
+        ev = {"text": (e.get("text") or "")[:200], "post_url": e.get("post_url")}
+        roster.append({
+            "brand_id": brand_id, "platform": "instagram", "handle": u,
+            "signal_type": "comment_on_brand", "evidence": ev,
+            "observed_at": e.get("observed_at"),
+        })
+        cid = pdb._find_creator_by_platform_profile(db, "instagram", None, u)
+        if cid:
+            affected.add(cid)
+            edges.append(_affinity_edge(
+                brand_id, cid, "comment_on_brand", match_basis="handle",
+                evidence={"commenter": u, **ev}, observed_at=e.get("observed_at"),
+            ))
+
+    for u in _brand_tagged_handles(posts, bh):
+        roster.append({
+            "brand_id": brand_id, "platform": "instagram", "handle": u,
+            "signal_type": "brand_tags_creator", "evidence": {"tagged_by_brand": True},
+        })
+        cid = pdb._find_creator_by_platform_profile(db, "instagram", None, u)
+        if cid:
+            affected.add(cid)
+            edges.append(_affinity_edge(
+                brand_id, cid, "brand_tags_creator", match_basis="handle",
+                direction="brand_to_creator",
+                evidence={"handle": u, "note": "brand tagged this creator"},
+            ))
+
+    if brand_name:
+        for col, st in (("organic_brand_mentions", "caption_mention"),
+                        ("paid_brand_mentions", "paid_partnership")):
+            try:
+                rows = (
+                    db.table("caption_intelligence").select("creator_id")
+                    .contains(col, [brand_name]).execute().data or []
+                )
+            except Exception:  # noqa: BLE001
+                rows = []
+            for r in rows:
+                cid = r.get("creator_id")
+                if not cid:
+                    continue
+                affected.add(cid)
+                edges.append(_affinity_edge(
+                    brand_id, cid, st, match_basis="name",
+                    evidence={"brand": brand_name, "source": col},
+                ))
+
+    pdb.upsert_brand_engagement_roster(db, roster)
+    pdb.upsert_brand_affinity_edges(db, edges)
+    for cid in affected:
+        pdb.recompute_creator_brand_affinity(db, brand_id, cid)
+    logger.info(
+        "Affinity @%s: %d commenters, %d edges, %d creators matched",
+        bh, len(seen), len(edges), len(affected),
+    )
+    return {"commenters": len(seen), "edges": len(edges), "matched": len(affected)}
+
+
+def handle_brand_affinity_harvest(db, job: dict) -> None:
+    """Standalone brand-side IG affinity harvest (re-run without re-analysing
+    the brand's content). One cheap Apify bundle → _harvest_affinity. Note:
+    brand_ig_scrape already runs affinity from its own scrape, so this is for
+    affinity-only refreshes."""
+    from pipeline import apify_instagram_bundle as bundle
+
+    brand_id = job["brand_id"]
+    brand = pdb.get_brand(db, brand_id)
+    if not brand:
+        raise ValueError(f"Brand {brand_id} not found")
+    handle = _brand_handle_from(brand)
+    if not handle:
+        logger.warning("Brand %s has no instagram_handle; skipping affinity", brand_id)
+        return
+    bh = handle.lower().lstrip("@")
+    b = bundle.fetch(bh, num_posts=12, num_reels=12, comments_per_reel=20)
+    posts = (b.get("posts") or []) + (b.get("reels") or [])
+    commenter_entries = [
+        {"handle": c.get("comment_user") or c.get("user_commenting"),
+         "text": c.get("comment"), "post_url": c.get("source_post_url"),
+         "observed_at": c.get("comment_date")}
+        for c in (b.get("comments") or [])
+    ]
+    _harvest_affinity(
+        db, brand_id, handle, (brand.get("brand_name") or "").strip(),
+        commenter_entries, posts,
+    )
 
 
 HANDLERS = {
     "brand_ig_scrape": handle_brand_ig_scrape,
+    "brand_affinity_harvest": handle_brand_affinity_harvest,
     "creator_ig_scrape": handle_creator_ig_scrape,
     "brand_yt_scrape": handle_brand_yt_scrape,
     "creator_yt_scrape": handle_creator_yt_scrape,
     "creator_multi_platform_scrape": handle_creator_multi_platform_scrape,
     "content_video_analysis": handle_content_video_analysis,
+    "instagram_dm_send_apify": handle_instagram_dm_send_apify,
+    "transcribe_async": handle_transcribe_async,
+    "audience_refresh": handle_audience_refresh,
 }
 
 

@@ -36,10 +36,48 @@ except ImportError:  # google-api-python-client not installed
     build = None
     HttpError = Exception
 
+try:
+    from httplib2.error import HttpLib2Error  # parent of ServerNotFoundError
+except ImportError:
+    HttpLib2Error = OSError  # fallback so the except clause stays valid
+
 logger = logging.getLogger(__name__)
 
 
-def _execute_with_retry(req, max_attempts: int = 4, base_backoff: float = 1.0):
+class QuotaExceededError(Exception):
+    """Raised when a YT Data API key returns 403 ``quotaExceeded``.
+
+    Distinct from ``HttpError`` so the multi-key pool (``YouTubeAPIPool``)
+    can mark the offending key as exhausted and rotate to the next without
+    treating it as a hard failure.
+    """
+
+
+def _is_quota_exceeded(err: HttpError) -> bool:
+    """Detect the YT Data API daily-quota error.
+
+    The body looks like ``{"error":{"code":403, "errors":[{"reason":"quotaExceeded", ...}]}}``.
+    Older clients sometimes return ``"reason":"dailyLimitExceeded"`` for
+    the same condition — we treat both as quota.
+    """
+    status = getattr(getattr(err, "resp", None), "status", 0)
+    try:
+        status = int(status)
+    except (TypeError, ValueError):
+        status = 0
+    if status != 403:
+        return False
+    content = getattr(err, "content", b"")
+    if isinstance(content, bytes):
+        try:
+            content = content.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            content = ""
+    text = content or ""
+    return "quotaExceeded" in text or "dailyLimitExceeded" in text
+
+
+def _execute_with_retry(req, max_attempts: int = 6, base_backoff: float = 2.0):
     """Execute a googleapiclient request with retry on transient network errors.
 
     googleapiclient's built-in retry covers httplib2 errors but not raw
@@ -53,6 +91,10 @@ def _execute_with_retry(req, max_attempts: int = 4, base_backoff: float = 1.0):
         try:
             return req.execute()
         except HttpError as e:
+            # Surface daily-quota exhaustion as a typed error so the
+            # multi-key pool can rotate without treating it as a real fail.
+            if _is_quota_exceeded(e):
+                raise QuotaExceededError(str(e)) from e
             status = getattr(getattr(e, "resp", None), "status", 0)
             try:
                 status = int(status)
@@ -69,7 +111,14 @@ def _execute_with_retry(req, max_attempts: int = 4, base_backoff: float = 1.0):
                 time.sleep(base_backoff * (2**attempt))
                 continue
             raise
-        except (ssl.SSLError, socket.timeout, ConnectionError, OSError) as e:
+        except (
+            ssl.SSLError,
+            socket.timeout,
+            socket.gaierror,
+            ConnectionError,
+            OSError,
+            HttpLib2Error,  # covers httplib2.ServerNotFoundError (DNS)
+        ) as e:
             last_exc = e
             if attempt + 1 >= max_attempts:
                 raise
@@ -178,6 +227,12 @@ class YouTubeAPIClient:
                 branding = (item.get("brandingSettings") or {}).get(
                     "channel", {}
                 ) or {}
+                thumbs = snippet.get("thumbnails") or {}
+                avatar_url = (
+                    (thumbs.get("high") or {}).get("url")
+                    or (thumbs.get("medium") or {}).get("url")
+                    or (thumbs.get("default") or {}).get("url")
+                )
                 out[item["id"]] = {
                     "channel_id": item["id"],
                     "title": snippet.get("title"),
@@ -186,6 +241,7 @@ class YouTubeAPIClient:
                     "country": snippet.get("country")
                     or branding.get("country"),
                     "custom_url": snippet.get("customUrl"),
+                    "avatar_url": avatar_url,
                     "subscriber_count": _to_int(stats.get("subscriberCount")),
                     "hidden_subscriber_count": bool(
                         stats.get("hiddenSubscriberCount", False)
@@ -400,6 +456,124 @@ class YouTubeAPIClient:
                 }
             )
         return threads
+
+    # ── Keyword search (Phase 3 — on-demand discovery) ──────────
+    #
+    # `search.list` costs 100 quota units per call, vs 1 for channels.list.
+    # We only use it in the discovery pipeline (interactive, user-triggered),
+    # never for routine pipeline work. The multi-key pool absorbs the cost.
+
+    def search_keyword_channels(
+        self,
+        query: str,
+        max_results: int = 200,
+        region_code: Optional[str] = None,
+    ) -> list[dict]:
+        """Return up to `max_results` channels matching `query` by YT relevance.
+
+        Paginates `search.list?type=channel&order=relevance` 50 at a time.
+        Each page is 100 quota units. Returns dicts with `channel_id, title,
+        description, thumbnails, channel_url`. Region-code biases toward
+        creators uploading in that geography (e.g. "IN" for India).
+        """
+        if not self.available or not query.strip():
+            return []
+        out: list[dict] = []
+        page_token: Optional[str] = None
+        # 200 max via 4 pages of 50; cap at API hard limit of 500.
+        max_results = max(1, min(500, max_results))
+        while len(out) < max_results:
+            try:
+                req_kwargs = {
+                    "part": "snippet",
+                    "q": query.strip(),
+                    "type": "channel",
+                    "order": "relevance",
+                    "maxResults": min(50, max_results - len(out)),
+                }
+                if region_code:
+                    req_kwargs["regionCode"] = region_code
+                if page_token:
+                    req_kwargs["pageToken"] = page_token
+                req = self._service.search().list(**req_kwargs)
+                resp = _execute_with_retry(req)
+            except HttpError:
+                break
+            for item in resp.get("items") or []:
+                snippet = item.get("snippet") or {}
+                channel_id = (item.get("id") or {}).get("channelId")
+                if not channel_id:
+                    continue
+                out.append(
+                    {
+                        "channel_id": channel_id,
+                        "title": snippet.get("channelTitle")
+                        or snippet.get("title"),
+                        "description": snippet.get("description"),
+                        "thumbnail": (
+                            (snippet.get("thumbnails") or {}).get("default")
+                            or {}
+                        ).get("url"),
+                        "channel_url": f"https://www.youtube.com/channel/{channel_id}",
+                    }
+                )
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return out
+
+    def search_keyword_video_channels(
+        self,
+        query: str,
+        max_videos: int = 200,
+        region_code: Optional[str] = None,
+    ) -> list[str]:
+        """Return unique channel IDs that have video matches for `query`.
+
+        Paginates `search.list?type=video&order=relevance` and de-dups
+        channel IDs from the snippet. Catches long-tail niche creators
+        who don't rank in channel-search but whose recent uploads match.
+
+        Each page costs 100 quota units. Returns up to ~max_videos worth
+        of unique channels — typically ~30–60% dedup ratio (one famous
+        creator gets multiple videos in the same search).
+        """
+        if not self.available or not query.strip():
+            return []
+        seen: set[str] = set()
+        out: list[str] = []
+        page_token: Optional[str] = None
+        max_videos = max(1, min(500, max_videos))
+        fetched = 0
+        while fetched < max_videos:
+            try:
+                req_kwargs = {
+                    "part": "snippet",
+                    "q": query.strip(),
+                    "type": "video",
+                    "order": "relevance",
+                    "maxResults": min(50, max_videos - fetched),
+                }
+                if region_code:
+                    req_kwargs["regionCode"] = region_code
+                if page_token:
+                    req_kwargs["pageToken"] = page_token
+                req = self._service.search().list(**req_kwargs)
+                resp = _execute_with_retry(req)
+            except HttpError:
+                break
+            items = resp.get("items") or []
+            fetched += len(items)
+            for item in items:
+                snippet = item.get("snippet") or {}
+                cid = snippet.get("channelId")
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    out.append(cid)
+            page_token = resp.get("nextPageToken")
+            if not page_token:
+                break
+        return out
 
 
 def _to_int(val, default: int = 0) -> int:

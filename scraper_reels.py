@@ -1,39 +1,24 @@
-from pipeline.brightdata_client import BrightdataClient
-
-DATASET_REELS = "gd_lyclm20il4r5helnj"
+"""Instagram reels scrape — Apify-backed."""
+from pipeline import apify_instagram_bundle
 
 
 def scrape_reels_discovery(
-    client: BrightdataClient,
     profile_url: str,
-    num_reels: int = 5,
+    num_reels: int = 10,
 ) -> list[dict]:
-    """
-    Discover reels directly from a creator's profile URL.
+    """Discover reels for a creator via the cached Apify bundle."""
+    username = _url_to_username(profile_url)
+    bundle = apify_instagram_bundle.fetch(username, num_reels=num_reels)
+    return bundle["reels"]
 
-    Uses /scrape endpoint with type=discover_new&discover_by=url_all_reels.
 
-    Cost: 1 record per reel = $0.0075 for 5 reels at $1.50/1K
-    """
-    input_obj = {
-        "url": profile_url,
-        "num_of_posts": num_reels,
-        "start_date": "",
-        "end_date": "",
-    }
-
-    extra_params = {
-        "type": "discover_new",
-        "discover_by": "url_all_reels",
-    }
-
-    return client.scrape_and_wait(DATASET_REELS, [input_obj], extra_params)
+def _url_to_username(url: str) -> str:
+    cleaned = url.rstrip("/")
+    return cleaned.rsplit("/", 1)[-1].lstrip("@")
 
 
 def select_top_reels(raw_reels: list[dict], top_n: int = 5) -> list[dict]:
-    """
-    From discovered reels, pick the top N by engagement for Whisper transcription.
-    """
+    """From discovered reels, pick the top N by engagement for transcription."""
     reels = [r for r in raw_reels if r.get("url")]
 
     reels.sort(
@@ -46,7 +31,7 @@ def select_top_reels(raw_reels: list[dict], top_n: int = 5) -> list[dict]:
 
 
 def _to_num(val, default=0):
-    """Coerce a value to float — Bright Data sometimes returns strings."""
+    """Coerce a value to float — upstream sometimes returns strings."""
     if val is None:
         return default
     try:
@@ -81,7 +66,6 @@ def extract_reel_metrics(reels: list[dict]) -> dict:
         if length > 0:
             lengths.append(length)
 
-        # Collect video URLs for Whisper
         video_url = reel.get("video_url")
         if video_url:
             video_urls.append(
@@ -93,7 +77,6 @@ def extract_reel_metrics(reels: list[dict]) -> dict:
                 }
             )
 
-        # Top comments for audience analysis
         top_comments = reel.get("top_comments") or []
         for comment in top_comments:
             all_top_comments.append(

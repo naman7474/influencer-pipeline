@@ -1,43 +1,115 @@
-"""Bright Data YouTube channel scraper.
+"""YouTube channel scrape — YouTube Data API v3 only.
 
-Parallel to pipeline/scraper_profiles.py on the Instagram side. Triggers the
-Bright Data YouTube-channel dataset, waits for completion, and returns raw
-records. `extract_channel_metrics` normalizes the record into the shape we
-write to `creator_social_profiles` (platform='youtube').
+Parallel to pipeline/scraper_profiles.py on the Instagram side. Pulls
+channel stats and metadata via the YT Data API and synthesises
+``external_links`` by regexing the channel description text.
 """
 
-import os
+import logging
+import re
 
-from pipeline.brightdata_client import BrightdataClient
 from pipeline.contact_extract import (
     extract_email_from_text,
     extract_phone_from_text,
 )
 
-# Bright Data dataset id for "YouTube - Channels". Override via env so ops can
-# rotate the dataset without a code change; the literal is a sensible default
-# matching the account's current YT dataset.
-DATASET_YT_CHANNELS = os.environ.get(
-    "BRIGHTDATA_DATASET_YT_CHANNELS", "gd_lk538t2k2p1k3oos71"
+logger = logging.getLogger(__name__)
+
+# URL regexes used to synthesise external_links from a channel's
+# description text — duplicated here so this module doesn't have to
+# import stitching (which imports back).
+_IG_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?instagram\.com/([A-Za-z0-9_.]+)", re.I
 )
+_TT_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?tiktok\.com/@([A-Za-z0-9_.]+)", re.I
+)
+_TWITTER_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:twitter\.com|x\.com)/([A-Za-z0-9_]+)",
+    re.I,
+)
+_GENERIC_URL_RE = re.compile(r"https?://[^\s\)<>\"]+", re.I)
+
 
 LOW_SUBSCRIBER_CUTOFF = 100
 
 
 def scrape_channels(
-    client: BrightdataClient, channel_urls: list[str]
+    channel_urls: list[str],
+    *,
+    yt_api,
+    channel_ids: list[str] | None = None,
 ) -> list[dict]:
-    """Scrape YouTube channel profile data for a batch of channel URLs.
+    """Pull channel records via the YouTube Data API.
 
-    Args:
-        client: Initialized BrightdataClient.
-        channel_urls: Canonical channel URLs — any of:
-            https://www.youtube.com/@handle
-            https://www.youtube.com/channel/UCxxxxxxxxxxxxxxxxxxxxxx
-            https://www.youtube.com/c/customname
+    ``channel_ids`` is parallel to ``channel_urls`` (same length / order).
+    When omitted, the caller resolved them already and we only have URLs
+    — that path is unreachable in the current orchestrator (which always
+    resolves channel ids first), but kept here as a guard.
     """
-    payload = [{"url": url} for url in channel_urls]
-    return client.trigger_and_wait(DATASET_YT_CHANNELS, payload)
+    if not yt_api or not yt_api.available:
+        raise RuntimeError(
+            "scrape_channels needs a configured YouTubeAPIClient; "
+            "BrightData fallback was removed in the pipeline rewrite."
+        )
+
+    if channel_ids is None:
+        raise RuntimeError(
+            "scrape_channels requires channel_ids (resolve via "
+            "pipeline.youtube.handle_resolver first)."
+        )
+
+    # `fetch_channel_stats` batches up to 50 ids internally.
+    stats_by_id = yt_api.fetch_channel_stats(channel_ids)
+
+    records: list[dict] = []
+    for url, channel_id in zip(channel_urls, channel_ids):
+        stats = stats_by_id.get(channel_id) or {}
+        description = stats.get("description") or ""
+        records.append(
+            {
+                "url": url,
+                "channel_id": channel_id,
+                "channel_name": stats.get("title"),
+                "custom_url": stats.get("custom_url"),
+                "description": description,
+                "profile_image": stats.get("avatar_url"),
+                "subscriber_count": stats.get("subscriber_count"),
+                "view_count": stats.get("view_count"),
+                "video_count": stats.get("video_count"),
+                "country": stats.get("country"),
+                "topic_categories": stats.get("topic_categories") or [],
+                "external_links": _extract_links_from_text(description),
+                "created_date": stats.get("published_at"),
+                "_data_provenance": "youtube_data_api_v3",
+            }
+        )
+    return records
+
+
+def _extract_links_from_text(text: str | None) -> list[dict]:
+    """Pull URLs the creator pasted into their description."""
+    if not text:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    def add(label: str, url: str) -> None:
+        u = url.rstrip(".,;)")
+        if u in seen:
+            return
+        seen.add(u)
+        out.append({"label": label, "url": u})
+
+    for m in _IG_URL_RE.finditer(text):
+        add("instagram", m.group(0))
+    for m in _TT_URL_RE.finditer(text):
+        add("tiktok", m.group(0))
+    for m in _TWITTER_URL_RE.finditer(text):
+        add("twitter", m.group(0))
+    for m in _GENERIC_URL_RE.finditer(text):
+        add("link", m.group(0))
+    return out
 
 
 def classify_creator_tier(subscribers: int) -> str:
@@ -63,12 +135,7 @@ def _to_int(val, default: int = 0) -> int:
 
 
 def extract_channel_metrics(raw_channel: dict) -> dict:
-    """Normalize a Bright Data YT channel record into creator_social_profiles shape.
-
-    Bright Data field names vary slightly across dataset versions. We probe
-    a few aliases rather than hard-failing — anything we can't find comes back
-    as None and the downstream write ignores nulls.
-    """
+    """Normalize a YT channel record into creator_social_profiles shape."""
     subs = _to_int(
         raw_channel.get("subscribers")
         or raw_channel.get("subscriber_count")
@@ -89,8 +156,6 @@ def extract_channel_metrics(raw_channel: dict) -> dict:
     if subs < LOW_SUBSCRIBER_CUTOFF:
         data_quality_flags.append("low_subscribers")
 
-    # Handle normalization: strip whitespace and a leading '@' so it's
-    # consistent with IG handles (Bright Data sometimes returns "  @x  ").
     raw_handle = (
         raw_channel.get("handle")
         or raw_channel.get("custom_url")
@@ -104,18 +169,12 @@ def extract_channel_metrics(raw_channel: dict) -> dict:
         or raw_channel.get("ucid")
     )
 
-    # Bright Data uses capitalized keys for some fields (`Links`, `Description`,
-    # `Details`) — probe both casings to tolerate dataset version drift.
     raw_links = (
         raw_channel.get("Links")
         or raw_channel.get("links")
         or raw_channel.get("external_links")
         or []
     )
-    # Three observed shapes: list of URL strings (current dataset), list of
-    # {label,url} dicts (older), or a dict {label: url}. Normalize to the
-    # list-of-{label,url} dict shape that stitching.extract_handles_from_links
-    # already accepts.
     external_links: list[dict | str] = []
     if isinstance(raw_links, dict):
         external_links = [
@@ -128,8 +187,6 @@ def extract_channel_metrics(raw_channel: dict) -> dict:
             elif isinstance(item, dict):
                 external_links.append(item)
 
-    # Country lives in `Details.location` (BD) — fall back to flat keys if the
-    # dataset shape changes.
     details = raw_channel.get("Details") or {}
     country = (
         (details.get("location") if isinstance(details, dict) else None)
@@ -144,13 +201,11 @@ def extract_channel_metrics(raw_channel: dict) -> dict:
     )
 
     # YouTube's About-page email is gated behind a CAPTCHA reveal that
-    # neither the Data API nor BD can fetch. So `email` always comes from
-    # bio extraction — `business@MKBHD.com` and similar are common.
+    # the Data API can't fetch. Email always comes from bio extraction.
     email = extract_email_from_text(bio)
     phone = extract_phone_from_text(bio)
 
     return {
-        # Identity
         "handle": handle,
         "platform_user_id": channel_id,
         "profile_url": raw_channel.get("url")
@@ -163,21 +218,15 @@ def extract_channel_metrics(raw_channel: dict) -> dict:
         "category": raw_channel.get("category") or raw_channel.get("topic"),
         "country": country,
         "is_verified": bool(raw_channel.get("verified", False)),
-        "is_business": False,  # YT has no direct analogue; leave false
-        # Metrics
+        "is_business": False,
         "followers_or_subs": subs,
         "posts_or_videos_count": videos_count,
         "total_views": total_views,
-        # Channel-age signal — fed into the YT-aware professionalism scorer.
         "channel_created_at": raw_channel.get("created_date")
         or raw_channel.get("published_at"),
-        # Contact info extracted from bio (YT has no dedicated email field)
         "email": email,
         "phone": phone,
-        # Computed
         "tier": classify_creator_tier(subs),
-        # Cross-platform stitching signal
         "external_links": external_links,
-        # Data quality signalling
         "data_quality_flags": data_quality_flags,
     }

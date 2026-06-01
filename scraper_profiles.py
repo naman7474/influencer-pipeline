@@ -1,30 +1,29 @@
-from pipeline.brightdata_client import BrightdataClient
+"""Instagram profile scrape — Apify-backed."""
+from pipeline import apify_instagram_bundle
 from pipeline.contact_extract import (
     extract_email_from_text,
     extract_phone_from_text,
 )
 
-DATASET_PROFILES = "gd_l1vikfch901nx3by4"
 
+def scrape_profiles(profile_urls: list[str]) -> list[dict]:
+    """Scrape Instagram profiles via the cached Apify bundle.
 
-def scrape_profiles(
-    client: BrightdataClient, profile_urls: list[str]
-) -> list[dict]:
+    Returns BD-shaped records — the downstream extractors haven't been
+    rewritten to consume Apify's native shape yet.
     """
-    Scrape Instagram profiles.
+    out: list[dict] = []
+    for url in profile_urls:
+        username = _url_to_username(url)
+        bundle = apify_instagram_bundle.fetch(username)
+        if bundle["profile"]:
+            out.append(bundle["profile"])
+    return out
 
-    Args:
-        client: Initialized BrightdataClient
-        profile_urls: List of Instagram profile URLs
-                      e.g. ["https://www.instagram.com/username/"]
 
-    Returns:
-        List of profile data dicts
-
-    Cost: 1 record per profile = $0.0015/profile at $1.50/1K
-    """
-    payload = [{"url": url} for url in profile_urls]
-    return client.trigger_and_wait(DATASET_PROFILES, payload)
+def _url_to_username(url: str) -> str:
+    cleaned = url.rstrip("/")
+    return cleaned.rsplit("/", 1)[-1].lstrip("@")
 
 
 LOW_FOLLOWER_CUTOFF = 100
@@ -32,7 +31,7 @@ LOW_FOLLOWER_CUTOFF = 100
 
 def extract_profile_metrics(raw_profile: dict) -> dict:
     """
-    Extract and compute Tier A profile-level metrics from raw Brightdata response.
+    Extract and compute Tier A profile-level metrics from the raw profile record.
 
     Emits a `data_quality_flags` list that downstream scorers consult:
       - "low_followers": < 100 followers, ER math is noise; we still
@@ -46,10 +45,6 @@ def extract_profile_metrics(raw_profile: dict) -> dict:
     if followers < LOW_FOLLOWER_CUTOFF:
         data_quality_flags.append("low_followers")
 
-    # Email/phone often live in the bio rather than the dedicated
-    # contact_email / contact_phone_number fields. The dedicated fields
-    # require the creator to opt in via Business Account settings, so
-    # they're frequently empty. Fall back to bio text.
     bio = raw_profile.get("biography") or ""
     email = raw_profile.get("contact_email") or extract_email_from_text(bio)
     phone = (
@@ -58,7 +53,6 @@ def extract_profile_metrics(raw_profile: dict) -> dict:
     )
 
     return {
-        # --- Identity ---
         "handle": raw_profile.get("account"),
         "instagram_id": raw_profile.get("id"),
         "fbid": raw_profile.get("fbid"),
@@ -69,28 +63,22 @@ def extract_profile_metrics(raw_profile: dict) -> dict:
         "city": raw_profile.get("city"),
         "country": raw_profile.get("country"),
         "category": raw_profile.get("category") or raw_profile.get("category_name"),
-        # --- Account Signals ---
         "followers": followers,
         "following": following,
         "posts_count": posts_count,
         "is_business": raw_profile.get("is_business_account", False),
         "is_professional": raw_profile.get("is_professional_account", False),
         "is_verified": raw_profile.get("is_verified", False),
-        # --- Computed Metrics (Tier A) ---
         "follower_following_ratio": round(followers / max(following, 1), 1),
         "posts_to_follower_efficiency": round(
             followers / max(posts_count, 1), 1
         ),
         "brightdata_avg_engagement": raw_profile.get("avg_engagement"),
-        # --- Creator Tier Classification ---
         "tier": classify_creator_tier(followers),
-        # --- Raw hashtags for niche classification ---
         "bio_hashtags": raw_profile.get("bio_hashtags", []),
         "post_hashtags": raw_profile.get("post_hashtags", []),
-        # --- Contact Info (with bio-fallback when dedicated fields empty) ---
         "email": email,
         "phone": phone,
-        # --- Data quality signalling ---
         "data_quality_flags": data_quality_flags,
     }
 

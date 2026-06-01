@@ -22,7 +22,13 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────
@@ -448,3 +454,136 @@ class LLMFailure(dict):
 
 def is_llm_failure(obj: Any) -> bool:
     return isinstance(obj, dict) and bool(obj.get("_llm_failure"))
+
+
+# ── Per-video / per-post payloads (Phase 3 foundation) ────────────
+# These mirror the post_intelligence table (migration 076). The per-video LLM
+# path emits ONE PostIntelligencePayload per analysed item; the aggregator rolls
+# them into CreatorAggregateIntelligence (distributions + medians) and derives
+# the legacy creator-level payloads above so existing consumers stay unchanged.
+
+def _coerce_signed_unit(v: Any) -> Optional[float]:
+    """Coerce to a signed [-1, 1] score (rescales 0-100 axes). For sentiment."""
+    if v is None or v == "":
+        return None
+    try:
+        n = float(v)
+    except (TypeError, ValueError):
+        return None
+    if n != n:  # NaN
+        return None
+    if abs(n) > 1.0:
+        n = max(-1.0, min(1.0, n / 100.0))
+    return round(n, 3)
+
+
+class PostCommentClassification(_Base):
+    """Per-post comment mix: emoji-only vs link/trigger vs real discussion."""
+
+    emoji_only_pct: Optional[float] = None
+    link_trigger_pct: Optional[float] = None
+    discussion_pct: Optional[float] = None
+    discussion_quality: Optional[str] = None      # shallow | moderate | deep
+    audience_intent: Optional[str] = None          # buy | learn | fan_support | criticize | spam
+    sentiment_score: Optional[float] = None        # signed [-1, 1]
+
+    @field_validator("emoji_only_pct", "link_trigger_pct", "discussion_pct", mode="before")
+    @classmethod
+    def _dec(cls, v):
+        return coerce_decimal_percentage(v)
+
+    @field_validator("sentiment_score", mode="before")
+    @classmethod
+    def _signed(cls, v):
+        return _coerce_signed_unit(v)
+
+
+class PostIntelligencePayload(_Base):
+    """One analysed post/video. Maps 1:1 to a post_intelligence row."""
+
+    item_id: Optional[str] = None
+    post_intent: Optional[str] = None              # educate | entertain | sell | inspire | personal | announce
+    content_pillar: Optional[str] = None
+    hook_style: Optional[str] = None               # question | statement | shock | story | direct_address | music
+    hook_quality: Optional[float] = None           # 0..1
+    emotional_trigger: Optional[str] = None        # curiosity | aspiration | humor | fear | relatability | none
+    cta_type: Optional[str] = None                 # link_in_bio | use_code | comment_trigger | follow | none
+    content_orientation: Optional[str] = None      # personal | informational | mixed
+    comment_classification: PostCommentClassification = Field(
+        default_factory=PostCommentClassification
+    )
+    demographics_signal: AudienceDemographics = Field(
+        default_factory=AudienceDemographics
+    )
+
+    @field_validator("hook_quality", mode="before")
+    @classmethod
+    def _dec(cls, v):
+        return coerce_decimal_percentage(v)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _sanitize(cls, data):
+        """Tolerate LLM shape drift so one odd field doesn't drop the whole
+        item. Coerces scalar string fields to str-or-None and forces the nested
+        objects to dicts (else the defaults apply). DeepSeek occasionally emits
+        a list/string where an object/scalar is expected — salvage rather than
+        hard-fail (which previously defaulted entire batches)."""
+        if not isinstance(data, dict):
+            return data
+        out = dict(data)
+        scalar_fields = (
+            "item_id", "post_intent", "content_pillar", "hook_style",
+            "emotional_trigger", "cta_type", "content_orientation",
+        )
+        for f in scalar_fields:
+            if f in out:
+                v = out[f]
+                if v is None or isinstance(v, str):
+                    continue
+                if isinstance(v, (list, tuple)):
+                    v = next((x for x in v if isinstance(x, str)), None)
+                elif isinstance(v, dict):
+                    v = None
+                else:
+                    v = str(v)
+                out[f] = v
+        for f in ("comment_classification", "demographics_signal"):
+            if f in out and not isinstance(out[f], dict):
+                out[f] = {}
+        return out
+
+
+class DistributionBucket(_Base):
+    """One slice of a creator-level distribution (drives the profile pies)."""
+
+    label: str
+    count: int = 0
+    pct: float = 0.0
+
+
+class CreatorAggregateIntelligence(_Base):
+    """Rolled-up per-post intelligence → distributions + median metrics.
+
+    The aggregator also derives the three legacy creator-level payloads from the
+    per-post rows; they are included here (optional) so the same object can feed
+    both the new distributions table and the existing intelligence writers.
+    """
+
+    intent_distribution: list[DistributionBucket] = Field(default_factory=list)
+    pillar_distribution: list[DistributionBucket] = Field(default_factory=list)
+    hook_style_distribution: list[DistributionBucket] = Field(default_factory=list)
+    cta_distribution: list[DistributionBucket] = Field(default_factory=list)
+    orientation_distribution: list[DistributionBucket] = Field(default_factory=list)
+    emotional_trigger_distribution: list[DistributionBucket] = Field(default_factory=list)
+
+    median_hook_quality: Optional[float] = None
+    median_engagement_rate: Optional[float] = None
+    median_discussion_pct: Optional[float] = None
+    median_sentiment_score: Optional[float] = None
+    posts_analyzed: int = 0
+
+    # Derived legacy payloads (optional — populated by the aggregator).
+    caption_intelligence: Optional[CaptionIntelligencePayload] = None
+    transcript_intelligence: Optional[TranscriptIntelligencePayload] = None
+    audience_intelligence: Optional[AudienceIntelligencePayload] = None
